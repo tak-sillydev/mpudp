@@ -1,0 +1,10 @@
+{
+	"device_list": ["enxb61bb0478eba"],
+	"receive_at": {
+		"port": 30010
+	},
+	"send_to": {
+		"address": "61.211.142.219",
+		"port": 30011
+	}
+}
