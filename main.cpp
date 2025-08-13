@@ -2,176 +2,374 @@
 	試作品：IPv4 only 2024-09-07
 */
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <fstream>
-#include <iostream>
+#include <linux/if_tun.h>
+#include <net/if.h>
+#include <fcntl.h>
 
-#include "json.hpp"
+#include <errno.h>
 
-using namespace std;
+#include <stdexcept>
 
-int main(void) {
-	fd_set	fds, rdfds;
-	int		nfds;
 
-	ifstream	ifs("./config.json");
+#define	MODE_SERVER	0
+#define	MODE_CLIENT	1
+#define	BUFSIZE		2048
 
-	if (ifs.fail()) {
-		cout << "FAIL: open config.json" << endl;
+#define	ETH_LENG	1
+
+#define	DEBUG
+
+#define	max(a, b)	(((a) > (b)) ? (a) : (b))
+
+void print_error(const char *format, ...);
+void print_debug(const char *format, ...);
+int tun_alloc(char *device_name);
+
+enum {
+	MODE_SPEED,
+	MODE_STABLE
+};
+
+// パケット転送に関わる情報（８バイト）
+// 転送される各パケットの前に付加される
+typedef struct {
+	char	mode;
+	char	reserved;
+	unsigned short	length;
+	unsigned int	stable_id;
+} TUN_HEADER;
+
+
+int tun_alloc(char *device_name) {
+	struct ifreq	ifr;
+	const char		*clone_device = "/dev/net/tun";
+	int		fd, err;
+
+	// /dev/net/tun を開く
+	if ((fd = open(clone_device, O_RDWR)) < 0) {
+		perror("Opening /dev/net/tun");
+		print_error("errno = %d\n", errno);
+		return fd;
+	}
+	memset(&ifr, 0, sizeof(ifr));
+
+	// インターフェース リクエスト（ifreq）の初期化
+	// TUN デバイス、かつ Ethernetヘッダを削除（TUNはネットワーク層なので使わない）
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+
+	if (*device_name) {
+		strncpy(ifr.ifr_name, device_name, IFNAMSIZ);
+	}
+	// 確保したいデバイス名を指定して /dev/net/tun に投げるとアクセス権限が取れる…らしい
+	// 事実上の socket() 関数
+	if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
+		perror("ioctl(TUNSETIFF)");
+		print_error("errno = %d\n", errno);
+		return err;
+	}
+	strcpy(device_name, ifr.ifr_name);	// これはなに？
+	return fd;
+}
+
+int eread(int fd, void *buf, int n) {
+	int nread;
+
+	if ((nread = read(fd, buf, n)) < 0) {
+		perror("Reading from socket");
+		print_error("errno = %d\n", errno);
+		throw std::runtime_error("nread smaller than zero");
+	}
+	return nread;
+}
+
+int ewrite(int fd, void *buf, int n) {
+	int nwrite;
+
+	if ((nwrite = write(fd, buf, n)) < 0) {
+		perror("Writing to socket");
+		print_error("errno = %d\n", errno);
+		throw std::runtime_error("nwrite smaller than zero");
+	}
+	return nwrite;
+}
+
+int readn(int fd, void *buf, int n) {
+	char	*b = (char*)buf;
+	int		nread, left = n;
+
+	while (left > 0) {
+		if ((nread = eread(fd, b, left)) == 0) {
+			return 0;
+		}
+		left -= nread;
+		b += nread;
+	}
+	return n;
+}
+
+void print_error(const char *format, ...) {
+	va_list	arg;
+
+	va_start(arg, format);
+	vfprintf(stderr, format, arg);
+	va_end(arg);
+}
+
+void print_debug(const char *format, ...) {
+#ifdef DEBUG
+	va_list	arg;
+
+	va_start(arg, format);
+	vfprintf(stderr, format, arg);
+	va_end(arg);
+#endif
+}
+
+int main(int argc, char* argv[]) {
+	fd_set	rfds;
+	int		max_fds, err;
+
+/*
+	int	option;
+	while ((option = getopt(argc, argv, "d:t:sc:")) > 0) {
+		switch (option) {
+		case 'd':
+			break;
+
+		case 't':
+			break;
+		
+		case 's':
+			break;
+
+		case 'c':
+			break;
+		}
+	}
+*/
+	const char	*device_list[1] = { "eth0" };	// データを再送信する実NWデバイス
+	char	tun_name[64] = "tun_test";		// データを受け取る tun デバイス
+	int		mode = MODE_SERVER;			// クライアントモードで動作
+
+	const char	*dst_addr	= "163.44.119.43";
+	const int	dst_port	= 45555;
+
+	// エラーチェック
+	if (*tun_name == '\0') {
+		print_error("tun device name not specified\n");
 		exit(1);
 	}
-	auto	config = nlohmann::json::parse(ifs);
-	auto	device_list = config["device_list"];
-	int		ndevices = device_list.size();
 
-	// tx_out (CAM側,接続元) <--> [ tx_in - rx_in ] <--> rx_out（モニタ側,接続先）
-	sockaddr_in6	addr_tx_in, addr_tx_out;
-	sockaddr_in		*addr_rx_in, addr_rx_out;
+	int	sock_tun;
 
-	int			sock_tx, *sock_rx;	// それぞれTX側、RX側と通信するためのソケット
-	int			rxmax = 0, counter = 0;
+	// TUN デバイスの確保（デバイスは事前に要セットアップ）
+	if ((sock_tun = tun_alloc(tun_name)) < 0) {
+		print_error("Couldn't connect to tun device - %s\n", tun_name);
+		exit(1);
+	}
+	print_debug("CONNECT OK - %s\n", tun_name);
 
-	timeval		tv;
-	int			optval = 1;
+	sockaddr_in		*addr_eth;	
+	int	*sock_eth;
+	int	eth_max = 0;
+	int	optval = 1;
 
-	unsigned int	szaddr = sizeof(addr_tx_out);
+	unsigned int	szaddr = sizeof(sockaddr_in);
 	ssize_t			szrecv, selret;
 
-	char	txbuf[2048], rxbuf[2048];
-	char	addrbuf[64];
+	char	sock_buf[BUFSIZE];
 
-	// TX側ソケット準備
-	sock_tx = socket(AF_INET6, SOCK_DGRAM, 0);
+	// eth 側ソケット準備
+	sock_eth = new int[ETH_LENG];
+	addr_eth = new sockaddr_in[ETH_LENG];
 
-	if (sock_tx == -1) { printf("FATAL: create TX socket\n"); return 0; }
-
-	setsockopt(sock_tx, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-	// リレーTX側　待受ポート指定
-	addr_tx_in.sin6_family		= AF_INET6;
-	addr_tx_in.sin6_addr		= IN6ADDR_ANY_INIT;
-	addr_tx_in.sin6_port		= htons(config["receive_at"]["port"]);
-	bind(sock_tx, (sockaddr *)&addr_tx_in, sizeof(addr_tx_in));
-
-	FD_ZERO(&rdfds);
-	FD_SET(sock_tx, &rdfds);
-
-	// RX側ソケット準備
-	sock_rx = new int[ndevices];
-	addr_rx_in = new sockaddr_in[ndevices];
-
-	if (sock_rx == nullptr) {
-		cout << "FATAL: allocate RX socket" << endl;
+	if (sock_eth == nullptr) {
+		perror("operator new");
+		print_error("Couldn't allocate buffer for socket: errno = %d\n", errno);
 		exit(1);
 	}
-	string		sendto_addr = config["send_to"]["address"];
-	uint16_t	sendto_port = config["send_to"]["port"];
-	char		port_str[16];
-	addrinfo	hints, *res;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family		= AF_INET;
-	hints.ai_socktype	= SOCK_DGRAM;
-
-	sprintf(port_str, "%hu", sendto_port);
-	if (getaddrinfo(sendto_addr.c_str(), port_str, &hints, &res) < 0) {
-		cout << "FATAL: get address info" << endl;
+	if (addr_eth == nullptr) {
+		perror("operator new");
+		print_error("Couldn't allocate buffer for address: errno = %d\n", errno);
 		exit(1);
 	}
-	// リレーRX側　接続先ポート指定
-	addr_rx_out = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
 
-	for (int i = 0; i < ndevices; i++) {
-		const char	*device = device_list[i].get<string>().c_str();
+	if (mode == MODE_CLIENT) {
+		// クライアントモード
+		// getaddrinfo() : hints に条件を入れてアドレスやらポートを指定すると
+		// いい感じにほかのパラメータを補って res に結果を入れて返す
+		char		port_str[16];
+		addrinfo	hints, *res;
 
-		sock_rx[i] = socket(res->ai_family, res->ai_socktype, 0);
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family		= AF_INET;
+		hints.ai_socktype	= SOCK_DGRAM;
 
-		if (sock_rx[i] == -1) { cout << "FATAL: create RX socket" << endl; return 0; }
+		sprintf(port_str, "%hu", dst_port);
+		if ((err = getaddrinfo(dst_addr, port_str, &hints, &res)) < 0) {
+			perror("getaddrinfo()");
+			print_error("err = %d, reason = %s\n", err, gai_strerror(err));
+			print_error("errno = %d\n", errno);
+			exit(1);
+		}
 
-		setsockopt(sock_rx[i], SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-		setsockopt(sock_rx[i], SOL_SOCKET, SO_BINDTODEVICE, device, strlen(device));
+		for (int i = 0; i < ETH_LENG; i++) {
+			// 使用する実デバイスにそれぞれソケットをくっつける
+			if ((sock_eth[i] = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
+				perror("socket()");
+				print_error("Couldn't create socket - %s\n", device_list[i]);
+				print_error("errno = %d\n", errno);
+				exit(1);
+			}
+			if (setsockopt(sock_eth[i], SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+				perror("setsockopt()");
+				print_error("Couldn't set value of SO_REUSEASSR - %s\n", device_list[i]);
+				print_error("errno = %d\n", errno);
+				exit(1);
+			}
+			if (setsockopt(sock_eth[i], SOL_SOCKET, SO_BINDTODEVICE, device_list[i], strlen(device_list[i])) < 0) {
+				perror("setsockopt()");
+				print_error("Couldn't set value of SO_BINDTODEVICE - %s\n", device_list[i]);
+				print_error("errno = %d\n", errno);
+				exit(1);
+			}
+			if (connect(sock_eth[i], res->ai_addr, res->ai_addrlen) < 0) {
+				perror("connect()");
+				print_error("device = %s, errno = %d\n", device_list[i], errno);
+				exit(1);
+			}
+			// eth側ソケットで使用されるポートを固定する（果たして必要なのか）
+			addr_eth[i].sin_family		= AF_INET;
+			addr_eth[i].sin_addr.s_addr	= htonl(INADDR_ANY);
+			addr_eth[i].sin_port		= htons(0);
+			bind(sock_eth[i], (sockaddr*)&addr_eth[i], sizeof(sockaddr));
+			getsockname(sock_eth[i], (sockaddr *)&addr_eth[i], &szaddr);		// bind() によって使用ポートが割り当てられたので情報を取得
 
-		// リレーRX側　待受ポート指定
-		addr_rx_in[i].sin_family		= AF_INET;
-		addr_rx_in[i].sin_addr.s_addr	= INADDR_ANY;
-		addr_rx_in[i].sin_port			= 0;
-		bind(sock_rx[i], (sockaddr *)&addr_rx_in[i], sizeof(sockaddr_in));
-		getsockname(sock_rx[i], (sockaddr *)&addr_rx_in[i], &szaddr);		// bind() によって使用ポートが割り当てられたので書き戻し
-
-		FD_SET(sock_rx[i], &rdfds);
-		rxmax = (rxmax > sock_rx[i]) ? rxmax : sock_rx[i];
+			print_debug("eth[%d]: addr: %s, port: %d\n",
+				i,
+				inet_ntoa(addr_eth[i].sin_addr),
+				ntohs(addr_eth[i].sin_port)
+			);
+			eth_max = max(sock_eth[i], eth_max);
+		}
+		freeaddrinfo(res);
 	}
-	freeaddrinfo(res);
-	nfds = (sock_tx > rxmax) ? sock_tx : rxmax;
+	else {
+		// サーバーモード
+		if ((*sock_eth = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+			perror("socket()");
+			print_error("Couldn't create socket - %s\n", device_list[0]);
+			print_error("errno = %d\n", errno);
+			exit(1);
+		}
+		if (setsockopt(*sock_eth, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+			perror("setsockopt()");
+			print_error("Couldn't set value of SO_REUSEASSR - %s\n", device_list[0]);
+			print_error("errno = %d\n", errno);
+		}
+		memset(addr_eth, 0, sizeof(*addr_eth));
+		addr_eth->sin_family		= AF_INET;
+		addr_eth->sin_addr.s_addr	= htonl(INADDR_ANY);
+		addr_eth->sin_port			= htons(dst_port);
 
-	memset(txbuf, 0, 2048);
-	memset(rxbuf, 0, 2048);
+		if (bind(*sock_eth, (sockaddr*)addr_eth, sizeof(*addr_eth)) < 0) {
+			perror("bind()");
+			print_error("errno = %d\n", errno);
+			exit(1);
+		}
+		getsockname(*sock_eth, (sockaddr*)addr_eth, &szaddr);
+		print_debug("eth: addr: %s, port: %d\n",
+			inet_ntoa(addr_eth->sin_addr),
+			ntohs(addr_eth->sin_port)
+		);
+		eth_max = *sock_eth;
+	}
+	memset(sock_buf, 0, BUFSIZE);
+	max_fds = max(sock_tun, eth_max);
+
+	int	nread, nwrite, tun_cnt = 0, eth_cnt = 0;
 
 	while (true) {
-		tv.tv_sec	= 0;
-		tv.tv_usec	= 500 * 1000;
 
-		memcpy(&fds, &rdfds, sizeof(fds));
-		selret = select(nfds + 1, &fds, NULL, NULL, &tv);	// データ到着まで待機、タイムアウト500ミリ秒
+		FD_ZERO(&rfds);
+		FD_SET(sock_tun, &rfds);
+		for (int i = 0; i < ETH_LENG; i++) { FD_SET(sock_eth[i], &rfds); }
+
+		selret = select(max_fds + 1, &rfds, NULL, NULL, NULL);	// データ到着まで待機
 
 		if (selret < 0) {
-			// エラー発生時
-			printf("error occured in select\n");	break;
-		}
-		else if (selret == 0) {
-			// タイムアウト発生時
-			continue;
-		}
+			if (errno == EINTR) continue;
 
-		if (FD_ISSET(sock_tx, &fds)) {
-			// TX側からデータ受信
-			// リレーTX側　接続先ポート取得
-			szrecv = recvfrom(sock_tx, txbuf, 2048, MSG_WAITALL, (sockaddr *)&addr_tx_out, &szaddr);
+			perror("select()");
+			print_error("errno = %d\n", errno);
+			exit(1);
+		}
+		if (FD_ISSET(sock_tun, &rfds)) {
+			// TUN にデータが入った
+			// TUN から取れるデータはIPパケットそのもの（IPヘッダが存在する）
+			try {
+				nread = eread(sock_tun, (void*)sock_buf, BUFSIZE);
+				print_debug("from tun seq=%d : read %lu bytes\n", tun_cnt, nread);
 
-			if (szrecv == -1) {
-				//printerr()
+				TUN_HEADER	tun_head = { (char)htons(MODE_SPEED), 0, htons((unsigned short)nread), 0 };
+
+				nwrite  = ewrite(sock_eth[tun_cnt % ETH_LENG], &tun_head, sizeof(tun_head));
+				nwrite += ewrite(sock_eth[tun_cnt % ETH_LENG], sock_buf, nread);
+
+				print_debug("to eth seq=%d : write %lu bytes\n", tun_cnt, nwrite);
 			}
-			inet_ntop(addr_tx_out.sin6_family, &addr_tx_out.sin6_addr, addrbuf, sizeof(addrbuf));
-			cout << "FROM TX " << addrbuf << ":" << htons(addr_tx_out.sin6_port) <<
-				"(" << szrecv << "bytes) " <<
-				"--> [RELAY IN " << htons(addr_tx_in.sin6_port) << " > ";
-
-			// 受信したデータをRX側へ流す
-			sendto(sock_rx[counter], txbuf, szrecv, 0, (sockaddr *)&addr_rx_out, sizeof(addr_rx_out));
-
-			inet_ntop(addr_rx_out.sin_family, &addr_rx_out.sin_addr, addrbuf, sizeof(addrbuf));
-			cout << "OUT " << htons(addr_rx_in[counter].sin_port) << "] --> TO RX " <<
-				addrbuf << ":" << htons(addr_rx_out.sin_port) << endl;
-			
-			if (++counter == ndevices) { counter = 0; }
+			catch (std::exception &e) {
+				print_error("eread() / ewrite(): %s - the data will be discarded. Continue.\n", e.what());
+			}
+			tun_cnt++;
 		}
-		for (int i = 0; i < ndevices; i++) {
-			if (FD_ISSET(sock_rx[i], &fds)) {
-				// RX側からデータ受信
-				// リレーRX側　接続先ポート取得（ユーザ指定値なのでやらなくてもいい）
-				szrecv = recvfrom(sock_rx[i], rxbuf, 2048, MSG_WAITALL, (sockaddr *)&addr_rx_out, &szaddr);
+		for (int i = 0; i < ETH_LENG; i++) {
+			if (FD_ISSET(sock_eth[i], &rfds)) {
+				// eth[i] にデータが入った
+				/* 
+				 * パケットサイズがMTUを超える場合、パケットは複数に分割される
+				 * この分割、また受信時の再合成の処理はより低レイヤー（ネットワーク層）で行われるので、
+				 * UDPのレイヤでは特に考えなくて良い。ただし、パケットが遅れて到着する可能性はあるので、
+				 * 送信したバイト数を読み切るまで待機する処理が必要（ここでは readn が行う）
+				 */
+				TUN_HEADER	tun_head;
 
-				inet_ntop(addr_rx_out.sin_family, &addr_rx_out.sin_addr, addrbuf, sizeof(addrbuf));
-				cout << "FROM RX " << addrbuf << ":" << htons(addr_rx_out.sin_port) <<
-					"(" << szrecv << "bytes) " <<
-					"--> [RELAY IN " << htons(addr_rx_in[i].sin_port) << "> ";
+				try {
+					nread = readn(sock_eth[i], &tun_head, sizeof(TUN_HEADER));
+					if (nread == 0) {
+						print_error("something went wrong at the other end\n");
+						goto end;	// 対向側でなんか異常がおきたっぽい（Ctrl-Cも含まれるとか）
+					}
 
-				// 受信したデータをTX側へ流す
-				sendto(sock_tx, rxbuf, szrecv, 0, (sockaddr *)&addr_tx_out, sizeof(addr_tx_out));
+					// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
+					nread += readn(sock_eth[i], sock_buf, ntohs(tun_head.length));
+					print_debug("from eth seq=%d : read %lu bytes\n", eth_cnt, nread);
 
-				inet_ntop(addr_tx_out.sin6_family, &addr_tx_out.sin6_addr, addrbuf, sizeof(addrbuf));
-				cout << "OUT " << htons(addr_tx_in.sin6_port) << "] --> TO TX " <<
-					addrbuf << ":" << htons(addr_tx_out.sin6_port) << endl;
+					nwrite = ewrite(sock_tun, sock_buf, ntohs(tun_head.length));
+					print_debug("to tun seq=%d : write %lu bytes\n", eth_cnt, nwrite);
+				}
+				catch (std::exception &e) {
+					print_error("eread() / ewrite(): %s - the data will be discarded. Continue.\n", e.what());
+				}
+				eth_cnt++;
 			}
 		}
 	}
-	close(sock_tx);
-	for (int i = 0; i < ndevices; i++) { close(sock_rx[i]); }
+end:
+	close(sock_tun);
+	for (int i = 0; i < ETH_LENG; i++) { close(sock_eth[i]); }
+	delete[] addr_eth;
+	delete[] sock_eth;
 
 	return 0;
 }
