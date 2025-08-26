@@ -201,7 +201,7 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
-	const char	*device_list[1] = { "eth0" };	// データを再送信する実NWデバイス
+	const char	*device_list[1] = { "wlp2s0" };	// データを再送信する実NWデバイス
 	char	tun_name[64] = "tun_test";		// データを受け取る tun デバイス
 
 	const char	*dst_addr	= "163.44.119.43";
@@ -444,18 +444,25 @@ int main(int argc, char* argv[]) {
 					 */
 					sockaddr_in	addr_from;
 					socklen_t	from_len;
+					int	n;
 
 					try {
-						nread = recvfrom(
+						n = recvfrom(
 							it->sock_fd, sock_buf, sizeof(TUN_HEADER),
 							MSG_WAITALL | MSG_PEEK, (sockaddr*)&addr_from, &from_len
 						);
+						if (n < 0) { throw std::runtime_error("recvfrom returned an invalid value"); }
+						nread = n;
+
 						print_debug("from eth seq=%d : read %lu bytes\n", eth_cnt, nread);
 						// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
-						nread += recvfrom(
+						n = recvfrom(
 							it->sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
 							MSG_WAITALL, (sockaddr*)&addr_from, &from_len
 						);
+						if (n < 0) { throw std::runtime_error("recvfrom returned an invalid value"); }
+						nread += n;
+						
 						print_debug("from eth seq=%d : read %lu bytes\n", eth_cnt, nread);
 						print_debug("IP header says: packet length = %lu\n", ntohs(((unsigned short*)pbuf_data)[1]));
 						print_debug("addr: %s, port: %d\n",	inet_ntoa(addr_from.sin_addr), ntohs(addr_from.sin_port));
@@ -464,7 +471,9 @@ int main(int argc, char* argv[]) {
 						print_debug("to tun seq=%d : write %lu bytes\n", eth_cnt, nwrite);
 					}
 					catch (std::exception &e) {
-						print_error("eread() / ewrite(): %s - the data will be discarded. Continue.\n", e.what());
+						perror("recvfrom");
+						print_debug("errno = %d\n", errno);
+						print_error("recvfrom: %s - the data will be discarded. Continue.\n", e.what());
 					}
 					eth_cnt++;
 				}
@@ -481,18 +490,25 @@ int main(int argc, char* argv[]) {
 			if (FD_ISSET(it->sock_fd, &rfds)) {
 				sockaddr_in	addr_from;
 				socklen_t	from_len;
+				int	n;
 
 				try {
-					nread = recvfrom(
+					n = recvfrom(
 						it->sock_fd, sock_buf, sizeof(TUN_HEADER),
 						MSG_WAITALL | MSG_PEEK, (sockaddr*)&addr_from, &from_len
 					);
+					if (n < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
+					nread = n;
 					print_debug("\tfrom eth seq=%d : read %lu bytes\n", eth_cnt, nread);
+
 					// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
-					nread += recvfrom(
+					n = recvfrom(
 						it->sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
 						MSG_WAITALL, (sockaddr*)&addr_from, &from_len
 					);
+					if (n < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
+					nread += n;
+
 					print_debug("---- SOCKET RECEIVED ----\n");
 					print_debug("\tfrom eth seq=%d : read %lu bytes\n", eth_cnt, nread);
 					print_debug("\ttun_head.length = %lu\n", pbuf_head->length);
@@ -511,7 +527,9 @@ int main(int argc, char* argv[]) {
 					print_debug("to tun seq=%d : write %lu bytes\n", eth_cnt, nwrite);
 				}
 				catch (std::exception &e) {
-					print_error("eread() / ewrite(): %s - the data will be discarded. Continue.\n", e.what());
+					perror("recvfrom");
+					print_debug("errno = %d\n", errno);
+					print_error("recvfrom: %s - the data will be discarded. Continue.\n", e.what());
 				}
 				eth_cnt++;
 
