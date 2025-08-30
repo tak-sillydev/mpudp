@@ -19,7 +19,8 @@
 #include <errno.h>
 
 #include <stdexcept>
-#include <list>
+#include <string>
+#include <vector>
 
 using namespace std;
 
@@ -27,8 +28,6 @@ using namespace std;
 #define	MODE_SERVER	0
 #define	MODE_CLIENT	1
 #define	BUFSIZE		2048
-
-#define	ETH_LENG	1
 
 #define	DEBUG
 
@@ -52,10 +51,42 @@ typedef struct {
 	unsigned int	stable_id;
 } TUN_HEADER;
 
-typedef struct {
+typedef struct _SOCKET_PACK {
 	int			sock_fd;
 	sockaddr_in	remote_addr;
 	sockaddr_in	local_addr;
+	std::string	eth_name;
+
+	explicit _SOCKET_PACK() : sock_fd(-1) {}
+	~_SOCKET_PACK() {
+		if (sock_fd != -1) { close(sock_fd); }
+	}
+
+	// デストラクタが呼ばれることによる意図せぬクローズを防ぐため、コピーを禁止
+	_SOCKET_PACK(const _SOCKET_PACK&) = delete;
+	_SOCKET_PACK& operator=(const _SOCKET_PACK&) = delete;
+
+	// かわりにムーブを強制する
+	_SOCKET_PACK(_SOCKET_PACK&& old) noexcept {
+		remote_addr	= old.remote_addr;
+		local_addr	= old.local_addr;
+		eth_name	= old.eth_name;
+		sock_fd		= old.sock_fd;
+		old.sock_fd = -1;
+	}
+
+	_SOCKET_PACK& operator=(_SOCKET_PACK&& old) noexcept {
+		if (this != &old) {
+			if (sock_fd != -1) close(sock_fd);
+
+			remote_addr	= old.remote_addr;
+			local_addr	= old.local_addr;
+			eth_name	= old.eth_name;
+			sock_fd		= old.sock_fd;
+			old.sock_fd = -1;
+		}
+		return *this;
+	}
 } SOCKET_PACK;
 
 
@@ -183,9 +214,24 @@ int main(int argc, char* argv[]) {
 	int	option;
 	int	mode = MODE_CLIENT;
 
+	/* 
+	 * socks :
+	 * クライアントモードの時は使用するNWデバイスに対応したソケット情報を、
+	 * サーバモードの時はそれぞれの接続元に対応したソケット情報を格納する
+	 */
+	std::vector<SOCKET_PACK>	socks;
+	socks.reserve(10);	// とりあえず10デバイス分のメモリを確保しておく
+
 	//while ((option = getopt(argc, argv, "d:t:sc:")) > 0) {
-	while ((option = getopt(argc, argv, "s")) > 0) {
+	while ((option = getopt(argc, argv, "i:s")) > 0) {
+		SOCKET_PACK	s;
+
 		switch (option) {
+		case 'i':
+			s.eth_name = optarg;
+			socks.emplace_back(std::move(s));
+			break;
+
 		case 'd':
 			break;
 
@@ -200,8 +246,6 @@ int main(int argc, char* argv[]) {
 			break;
 		}
 	}
-
-	const char	*device_list[1] = { "wlp2s0" };	// データを再送信する実NWデバイス
 	char	tun_name[64] = "tun_test";		// データを受け取る tun デバイス
 
 	const char	*dst_addr	= "163.44.119.43";
@@ -222,12 +266,6 @@ int main(int argc, char* argv[]) {
 	}
 	print_debug("CONNECT OK - %s\n", tun_name);
 
-	/* 
-	 * *socks :
-	 * クライアントモードの時は使用するNWデバイスに対応したソケット情報を、
-	 * サーバモードの時はそれぞれの接続元に対応したソケット情報を格納する
-	 */
-	std::list<SOCKET_PACK>	socks;
 	int	eth_max = 0;
 	int	optval = 1;
 
@@ -258,26 +296,24 @@ int main(int argc, char* argv[]) {
 			exit(1);
 		}
 
-		for (int i = 0; i < ETH_LENG; i++) {
-			SOCKET_PACK	s;
-
+		for (auto& s : socks) {
 			// 使用する実デバイスにそれぞれソケットをくっつける
 			// ソケットの作成とオプションの設定
 			if ((s.sock_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
 				perror("socket()");
-				print_error("Couldn't create socket - %s\n", device_list[i]);
+				print_error("Couldn't create socket - %s\n", s.eth_name.c_str());
 				print_error("errno = %d\n", errno);
 				exit(1);
 			}
 			if (setsockopt(s.sock_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
 				perror("setsockopt()");
-				print_error("Couldn't set value of SO_REUSEASSR - %s\n", device_list[i]);
+				print_error("Couldn't set value of SO_REUSEASSR - %s\n", s.eth_name.c_str());
 				print_error("errno = %d\n", errno);
 				exit(1);
 			}
-			if (setsockopt(s.sock_fd, SOL_SOCKET, SO_BINDTODEVICE, device_list[i], strlen(device_list[i])) < 0) {
+			if (setsockopt(s.sock_fd, SOL_SOCKET, SO_BINDTODEVICE, s.eth_name.c_str(), s.eth_name.length()) < 0) {
 				perror("setsockopt()");
-				print_error("Couldn't set value of SO_BINDTODEVICE - %s\n", device_list[i]);
+				print_error("Couldn't set value of SO_BINDTODEVICE - %s\n", s.eth_name.c_str());
 				print_error("errno = %d\n", errno);
 				exit(1);
 			}
@@ -285,7 +321,7 @@ int main(int argc, char* argv[]) {
 			// 接続先の設定
 			if (connect(s.sock_fd, res->ai_addr, res->ai_addrlen) < 0) {
 				perror("connect()");
-				print_error("device = %s, errno = %d\n", device_list[i], errno);
+				print_error("device = %s, errno = %d\n", s.eth_name.c_str(), errno);
 				exit(1);
 			}
 			s.remote_addr = *(sockaddr_in *)res->ai_addr;
@@ -297,31 +333,32 @@ int main(int argc, char* argv[]) {
 			bind(s.sock_fd, (sockaddr*)&(s.local_addr), sizeof(sockaddr));
 			getsockname(s.sock_fd, (sockaddr*)&(s.local_addr), &szaddr);	// bind() によって使用ポートが割り当てられたので情報を取得
 
-			print_debug("eth[%d]: local addr: %s, port: %d\n",
-				i,
+			print_debug("eth[%s]: fd: %d, local addr: %s, port: %d\n",
+				s.eth_name.c_str(),
+				s.sock_fd,
 				inet_ntoa(s.local_addr.sin_addr),
 				ntohs(s.local_addr.sin_port)
 			);
 			eth_max = max(s.sock_fd, eth_max);
-			socks.emplace_back(s);
 		}
 		freeaddrinfo(res);
 	}
 	else {
 		// サーバーモード
 		// サーバーモードでは、リストの先頭が接続待ち受けソケットになる
+		socks.clear();
 		SOCKET_PACK	s;
 
 		// ソケットの作成とオプションの設定
 		if ((s.sock_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 			perror("socket()");
-			print_error("Couldn't create socket - %s\n", device_list[0]);
+			print_error("Couldn't create socket\n");
 			print_error("errno = %d\n", errno);
 			exit(1);
 		}
 		if (setsockopt(s.sock_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
 			perror("setsockopt()");
-			print_error("Couldn't set value of SO_REUSEASSR - %s\n", device_list[0]);
+			print_error("Couldn't set value of SO_REUSEASSR\n");
 			print_error("errno = %d\n", errno);
 		}
 		memset(&s.local_addr, 0, sizeof(s.local_addr));
@@ -339,21 +376,22 @@ int main(int argc, char* argv[]) {
 			inet_ntoa(s.local_addr.sin_addr),
 			ntohs(s.local_addr.sin_port)
 		);
-		socks.emplace_front(s);
 		eth_max = s.sock_fd;
+		socks.emplace_back(std::move(s));
 	}
 	memset(sock_buf, 0, sizeof(TUN_HEADER) + BUFSIZE);
 	max_fds = max(sock_tun, eth_max);
 
 	int		nread, nwrite, tun_cnt = 0, eth_cnt = 0;
-	auto 	socks_it = socks.cbegin();
+	auto 	socks_it = socks.begin();
 
 	while (true) {
 
 		// サーバーモードの時、sock_fd は全部同じ値なので気にしなくて良い
 		FD_ZERO(&rfds);
 		FD_SET(sock_tun, &rfds);
-		for (auto& s : socks) { FD_SET(s.sock_fd, &rfds); }
+		print_debug("sock_tun = %d, eth_max = %d, max_fds = %d\n", sock_tun, eth_max, max_fds);
+		for (auto& s : socks) { print_debug("sock_fd = %d\n", s.sock_fd); FD_SET(s.sock_fd, &rfds); }
 		
 		selret = select(max_fds + 1, &rfds, NULL, NULL, NULL);	// データ到着まで待機
 
@@ -362,7 +400,7 @@ int main(int argc, char* argv[]) {
 
 			perror("select()");
 			print_error("errno = %d\n", errno);
-			exit(1);
+			goto end;
 		}
 		if (FD_ISSET(sock_tun, &rfds)) {
 			// TUN にデータが入った
@@ -395,8 +433,9 @@ int main(int argc, char* argv[]) {
 						(sockaddr*)&socks_it->remote_addr, sizeof(socks_it->remote_addr)
 					);
 
+					print_debug("device = %s\n", socks_it->eth_name.c_str());
 					socks_it++;
-					if (socks_it == socks.cend()) { socks_it = socks.cbegin(); }
+					if (socks_it == socks.cend()) { socks_it = socks.begin(); }
 				}
 				else {
 					/* 
@@ -408,15 +447,15 @@ int main(int argc, char* argv[]) {
 					print_debug("server to eth, socks len = %d\n", socks.size());
 					pbuf_head->mode = (char)MODE_STABLE;
 
-					for (auto it = std::next(socks.cbegin()); it != socks.cend(); it++) {
+					for (size_t i = 1; i < socks.size(); i++) {
 						nwrite = sendto(
-							it->sock_fd, sock_buf, nread, 0,
-							(sockaddr*)&it->remote_addr, sizeof(it->remote_addr)
+							socks[i].sock_fd, sock_buf, nread, 0,
+							(sockaddr*)&(socks[i].remote_addr), sizeof(socks[i].remote_addr)
 						);
 						print_debug(
 							"to eth addr: %s, port: %d\n",
-							inet_ntoa(it->remote_addr.sin_addr),
-							ntohs(it->remote_addr.sin_port)
+							inet_ntoa(socks[i].remote_addr.sin_addr),
+							ntohs(socks[i].remote_addr.sin_port)
 						);
 					}
 				}
@@ -433,8 +472,8 @@ int main(int argc, char* argv[]) {
 			 * クライアントモードモードでは、socks の各要素はそれぞれの eth デバイスに割り当てられたソケット
 			 * イテレータを走査してデータを受信する
 			 */
-			for (auto it = socks.cbegin(); it != socks.cend(); it++) {
-				if (FD_ISSET(it->sock_fd, &rfds)) {
+			for (auto& s : socks) {
+				if (FD_ISSET(s.sock_fd, &rfds)) {
 					// eth[i] にデータが入った
 					/* 
 					 * パケットサイズがMTUを超える場合、パケットは複数に分割される
@@ -447,9 +486,11 @@ int main(int argc, char* argv[]) {
 					int	n;
 
 					try {
+						from_len = sizeof(sockaddr_in);
+						print_debug("device = %s, fd = %d\n", s.eth_name.c_str(), s.sock_fd);
 						n = recvfrom(
-							it->sock_fd, sock_buf, sizeof(TUN_HEADER),
-							MSG_WAITALL | MSG_PEEK, (sockaddr*)&addr_from, &from_len
+							s.sock_fd, sock_buf, sizeof(TUN_HEADER),
+							MSG_PEEK, (sockaddr*)&addr_from, &from_len
 						);
 						if (n < 0) { throw std::runtime_error("recvfrom returned an invalid value"); }
 						nread = n;
@@ -457,7 +498,7 @@ int main(int argc, char* argv[]) {
 						print_debug("from eth seq=%d : read %lu bytes\n", eth_cnt, nread);
 						// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
 						n = recvfrom(
-							it->sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
+							s.sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
 							MSG_WAITALL, (sockaddr*)&addr_from, &from_len
 						);
 						if (n < 0) { throw std::runtime_error("recvfrom returned an invalid value"); }
@@ -474,6 +515,7 @@ int main(int argc, char* argv[]) {
 						perror("recvfrom");
 						print_debug("errno = %d\n", errno);
 						print_error("recvfrom: %s - the data will be discarded. Continue.\n", e.what());
+						goto end;
 					}
 					eth_cnt++;
 				}
@@ -485,17 +527,18 @@ int main(int argc, char* argv[]) {
 			 * サーバーモードでは、監視対象はリストの先頭のソケットのみ
 			 * あとのソケットは使用されず、経路情報だけを参照する
 			 */
-			const auto&	it = socks.cbegin();
+			const auto&	sock_recv = socks[0];
 
-			if (FD_ISSET(it->sock_fd, &rfds)) {
+			if (FD_ISSET(sock_recv.sock_fd, &rfds)) {
 				sockaddr_in	addr_from;
 				socklen_t	from_len;
 				int	n;
 
 				try {
+					from_len = sizeof(sockaddr_in);
 					n = recvfrom(
-						it->sock_fd, sock_buf, sizeof(TUN_HEADER),
-						MSG_WAITALL | MSG_PEEK, (sockaddr*)&addr_from, &from_len
+						sock_recv.sock_fd, sock_buf, sizeof(TUN_HEADER),
+						MSG_PEEK, (sockaddr*)&addr_from, &from_len
 					);
 					if (n < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
 					nread = n;
@@ -503,7 +546,7 @@ int main(int argc, char* argv[]) {
 
 					// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
 					n = recvfrom(
-						it->sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
+						sock_recv.sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
 						MSG_WAITALL, (sockaddr*)&addr_from, &from_len
 					);
 					if (n < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
@@ -534,17 +577,16 @@ int main(int argc, char* argv[]) {
 				eth_cnt++;
 
 				// 今までにない経路からの通信なら返信リストに登録
-				for (auto it = std::next(socks.cbegin());; it++) {
-					if (it == socks.cend()) {
-						SOCKET_PACK	s;
+				for (size_t i = 0; i < socks.size(); i++) {
+					if (is_same_addr(addr_from, socks[i].remote_addr) && i != 0) { break; }
+					if (i >= socks.size() - 1) {
+						SOCKET_PACK	s_tmp;
 
-						s.sock_fd = socks.begin()->sock_fd;
-						s.local_addr  = socks.begin()->local_addr;
-						s.remote_addr = addr_from;
-						socks.emplace_back(s);
-						break;
+						s_tmp.sock_fd		= socks.begin()->sock_fd;
+						s_tmp.local_addr 	= socks.begin()->local_addr;
+						s_tmp.remote_addr	= addr_from;
+						socks.emplace_back(std::move(s_tmp));
 					}
-					if (is_same_addr(addr_from, it->remote_addr)) { break; }
 				}
 			}
 		}
