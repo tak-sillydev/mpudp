@@ -1,26 +1,15 @@
 /*
 	試作品：IPv4 only 2024-09-07
 */
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <linux/if_tun.h>
-#include <net/if.h>
-#include <fcntl.h>
-
 #include <errno.h>
 
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "print.h"
+#include "network.h"
 
 using namespace std;
 
@@ -29,65 +18,7 @@ using namespace std;
 #define	MODE_CLIENT	1
 #define	BUFSIZE		2048
 
-#define	DEBUG
-
 #define	max(a, b)	(((a) > (b)) ? (a) : (b))
-
-void print_error(const char *format, ...);
-void print_debug(const char *format, ...);
-int tun_alloc(char *device_name);
-
-enum {
-	MODE_SPEED,
-	MODE_STABLE
-};
-
-// パケット転送に関わる情報（８バイト）
-// 転送される各パケットの前に付加される
-typedef struct {
-	char	mode;
-	char	reserved;
-	unsigned short	length;
-	unsigned int	stable_id;
-} TUN_HEADER;
-
-typedef struct _SOCKET_PACK {
-	int			sock_fd;
-	sockaddr_in	remote_addr;
-	sockaddr_in	local_addr;
-	std::string	eth_name;
-
-	explicit _SOCKET_PACK() : sock_fd(-1) {}
-	~_SOCKET_PACK() {
-		if (sock_fd != -1) { close(sock_fd); }
-	}
-
-	// デストラクタが呼ばれることによる意図せぬクローズを防ぐため、コピーを禁止
-	_SOCKET_PACK(const _SOCKET_PACK&) = delete;
-	_SOCKET_PACK& operator=(const _SOCKET_PACK&) = delete;
-
-	// かわりにムーブを強制する
-	_SOCKET_PACK(_SOCKET_PACK&& old) noexcept {
-		remote_addr	= old.remote_addr;
-		local_addr	= old.local_addr;
-		eth_name	= old.eth_name;
-		sock_fd		= old.sock_fd;
-		old.sock_fd = -1;
-	}
-
-	_SOCKET_PACK& operator=(_SOCKET_PACK&& old) noexcept {
-		if (this != &old) {
-			if (sock_fd != -1) close(sock_fd);
-
-			remote_addr	= old.remote_addr;
-			local_addr	= old.local_addr;
-			eth_name	= old.eth_name;
-			sock_fd		= old.sock_fd;
-			old.sock_fd = -1;
-		}
-		return *this;
-	}
-} SOCKET_PACK;
 
 
 unsigned long hash(void* buf, int size) {
@@ -98,113 +29,6 @@ unsigned long hash(void* buf, int size) {
 	return h;
 }
 
-bool is_same_addr(const sockaddr_in& a, const sockaddr_in& b) {
-	return	a.sin_addr.s_addr == b.sin_addr.s_addr &&
-			a.sin_port == b.sin_port &&
-			a.sin_family == b.sin_family;
-}
-
-int tun_alloc(char *device_name) {
-	struct ifreq	ifr;
-	const char		*clone_device = "/dev/net/tun";
-	int		fd, err;
-
-	// /dev/net/tun を開く
-	if ((fd = open(clone_device, O_RDWR)) < 0) {
-		perror("Opening /dev/net/tun");
-		print_error("errno = %d\n", errno);
-		return fd;
-	}
-	memset(&ifr, 0, sizeof(ifr));
-
-	// インターフェース リクエスト（ifreq）の初期化
-	// TUN デバイス、かつ Ethernetヘッダを削除（TUNはネットワーク層なので使わない）
-	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-
-	if (*device_name) {
-		strncpy(ifr.ifr_name, device_name, IFNAMSIZ);
-	}
-	// 確保したいデバイス名を指定して /dev/net/tun に投げるとアクセス権限が取れる…らしい
-	// 事実上の socket() 関数
-	if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
-		perror("ioctl(TUNSETIFF)");
-		print_error("errno = %d\n", errno);
-		return err;
-	}
-	strcpy(device_name, ifr.ifr_name);	// これはなに？
-	return fd;
-}
-
-int tun_eread(int fd, void *buf, int n) {
-	int nread;
-
-	if ((nread = read(fd, buf, n)) < 0) {
-		perror("Reading from socket");
-		print_error("errno = %d\n", errno);
-		throw std::runtime_error("nread smaller than zero");
-	}
-	return nread;
-}
-
-int tun_ewrite(int fd, void *buf, int n) {
-	int nwrite;
-
-	if ((nwrite = write(fd, buf, n)) < 0) {
-		perror("Writing to socket");
-		print_error("errno = %d\n", errno);
-		throw std::runtime_error("nwrite smaller than zero");
-	}
-	return nwrite;
-}
-
-int tun_readn(int fd, void *buf, int n) {
-	char	*b = (char*)buf;
-	int		nread, left = n;
-
-	while (left > 0) {
-		if ((nread = tun_eread(fd, b, left)) == 0) {
-			return 0;
-		}
-		left -= nread;
-		b += nread;
-	}
-	return n;
-}
-
-int eth_recvn(int fd, void* buf, int n, int flags, sockaddr_in* addr) {
-	char	*b = (char*)buf;
-	int		nread, left = n;
-	socklen_t	szaddr = sizeof(*addr);
-
-	while (left > 0) {
-		if ((nread = recvfrom(fd, b, left, flags, (sockaddr*)addr, &szaddr)) <= 0) {
-			perror("Reading from UDP packet");
-			print_error("errno = %d\n", errno);
-			throw std::runtime_error("nread below or equal to zero");
-		}
-		left -= nread;
-		b += nread;
-	}
-	return n;
-}
-
-void print_error(const char *format, ...) {
-	va_list	arg;
-
-	va_start(arg, format);
-	vfprintf(stderr, format, arg);
-	va_end(arg);
-}
-
-void print_debug(const char *format, ...) {
-#ifdef DEBUG
-	va_list	arg;
-
-	va_start(arg, format);
-	vfprintf(stderr, format, arg);
-	va_end(arg);
-#endif
-}
 
 int main(int argc, char* argv[]) {
 	fd_set	rfds;
