@@ -21,6 +21,8 @@
 
 #define	max(a, b)	(((a) > (b)) ? (a) : (b))
 
+#define	BUFSIZE		2048
+
 enum {
 	MODE_SPEED,
 	MODE_STABLE
