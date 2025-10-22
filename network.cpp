@@ -2,7 +2,7 @@
 #include "print.h"
 
 bool is_same_addr(const sockaddr_in& a, const sockaddr_in& b) {
-	return	a.sin_addr.s_addr == b.sin_addr.s_addr &&
+	return a.sin_addr.s_addr == b.sin_addr.s_addr &&
 			a.sin_port == b.sin_port &&
 			a.sin_family == b.sin_family;
 }
@@ -73,3 +73,4 @@ int tun_readn(int fd, void *buf, int n) {
 	}
 	return n;
 }
+

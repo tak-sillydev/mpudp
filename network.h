@@ -17,19 +17,22 @@
 
 #include <string>
 #include <stdexcept>
+#include <vector>
+
+#define	max(a, b)	(((a) > (b)) ? (a) : (b))
 
 enum {
 	MODE_SPEED,
 	MODE_STABLE
 };
 
-// パケット転送に関わる情報（８バイト）
+// パケット転送に関わる情報（8バイト）
 // 転送される各パケットの前に付加される
 typedef struct {
 	char	mode;
-	char	reserved;
-	unsigned short	length;
-	unsigned int	stable_id;
+	unsigned char	device_id;	// Ethernetデバイスに振られるID（実際にはソケットのFD）
+	unsigned short	length;		// データペイロード長
+	unsigned int	seq;		// シーケンス（MODE = SPEED / STABLEで扱いが異なる）
 } TUN_HEADER;
 
 typedef struct _SOCKET_PACK {
@@ -69,6 +72,14 @@ typedef struct _SOCKET_PACK {
 		return *this;
 	}
 } SOCKET_PACK;
+
+class SocketManager {
+private:
+	std::vector<SOCKET_PACK>	socks;
+
+public:
+	virtual bool setup(int& max_fd, const char* addr, const int port);
+};
 
 bool is_same_addr(const sockaddr_in& a, const sockaddr_in& b);
 int tun_alloc(char *device_name);
