@@ -78,6 +78,10 @@ int main(int argc, char* argv[]) {
 		print_error("tun device name not specified\n");
 		exit(1);
 	}
+	if (mode == MODE_CLIENT && device.size() == 0) {
+		print_error("any eth device not specified\n");
+		exit(1);
+	}
 
 	int	sock_tun, sock_recv;
 
@@ -103,7 +107,10 @@ int main(int argc, char* argv[]) {
 		}
 		freeaddrinfo(res);
 
+		auto t = client::send_echo_thread(socks);
 		client::main_loop(sock_tun, socks);
+
+		t->join();
 	}
 	else {
 		// サーバーモード

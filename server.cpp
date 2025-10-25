@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <stdexcept>
+#include <chrono>
 
 #include "print.h"
 #include "server.h"
@@ -39,6 +40,32 @@ namespace server {
 			ntohs(local_addr.sin_port)
 		);
 		return true;
+	}
+
+	// どこにも送信しなかったときは０を返す
+	ssize_t send_stable(uint8_t *buf, int sock_recv, std::vector<SOCKET_PACK>& socks, uint16_t data_len) {
+		ssize_t nwrite = 0;
+
+		// それぞれのソケットリストに書かれたアドレスへパケットを送信
+		for (auto& s : socks) {
+			nwrite = sendto(
+				sock_recv, buf, data_len, 0,
+				(sockaddr*)&(s.remote_addr), sizeof(s.remote_addr)
+			);
+			if (nwrite < 0) { throw std::runtime_error("sendto returned an invalid value"); }
+			pdebug(
+				"packet was sent to : %s:%d\n",
+				inet_ntoa(s.remote_addr.sin_addr), ntohs(s.remote_addr.sin_port)
+			);
+		}
+		return nwrite;
+	}
+
+	void process_echo_packet(ECHO_PACKET *echo, int sock_recv, std::vector<SOCKET_PACK>& socks) {
+		echo->tun_header.mode = MODE_STABLE;
+
+		pdebug("device_id = %d, seq = %d, time = %ld\n", echo->tun_header.device_id, echo->seq, echo->tm_start);
+		send_stable((uint8_t*)echo, sock_recv, socks, sizeof(ECHO_PACKET));
 	}
 
 	/*
@@ -82,24 +109,16 @@ namespace server {
 					pdebug_tunrecv(tun_seq, nread, pbuf_data);
 					tun_seq++;
 
-					pbuf_head->mode = (char)MODE_STABLE;
+					pbuf_head->mode = MODE_STABLE;
+					pbuf_head->type = PACKET_TYPE_GENERAL;
 					pbuf_head->device_id = 0xff;
 					pbuf_head->length = nread;
 					pbuf_head->seq = stable_id++;
 					nread += sizeof(TUN_HEADER);
 
 					// それぞれのソケットリストに書かれたアドレスへパケットを送信
-					for (auto& s : socks) {
-						nwrite = sendto(
-							sock_recv, sock_buf, nread, 0,
-							(sockaddr*)&(s.remote_addr), sizeof(s.remote_addr)
-						);
-						if (nwrite < 0) { throw std::runtime_error("sendto returned an invalid value"); }
-						pdebug(
-							"packet was sent to : %s:%d\n",
-							inet_ntoa(s.remote_addr.sin_addr), ntohs(s.remote_addr.sin_port)
-						);
-					}
+					send_stable(sock_buf, sock_recv, socks, nread);
+
 				} catch (std::exception& e) {
 					perror("eread / sendto");
 					print_error("errno = %d\n");
@@ -112,31 +131,38 @@ namespace server {
 				 */
 				sockaddr_in	addr_from;
 				socklen_t	from_len;
-				int	n;
 
 				try {
 					pdebug("\n===== ETH DEVICE RECEIVED DATA =====\n");
 
 					from_len = sizeof(sockaddr_in);
-					n = recvfrom(
+					nread = recvfrom(
 						sock_recv, sock_buf, sizeof(TUN_HEADER),
 						MSG_PEEK, (sockaddr*)&addr_from, &from_len
 					);
-					if (n < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
-					nread = n;
+					if (nread < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
 
 					// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
-					n = recvfrom(
+					nread = recvfrom(
 						sock_recv, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
 						MSG_WAITALL, (sockaddr*)&addr_from, &from_len
 					);
-					if (n < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
-					nread += n;
+					if (nread < 0) { throw std::runtime_error("recvfrom returned an invalid number"); }
 
 					pdebug_ethrecv(eth_seq, nread, sock_buf, addr_from);
 
-					nwrite = tun_ewrite(sock_tun, pbuf_data, pbuf_head->length);
-					pdebug("packet was sent to tun seq=%d : write %lu bytes\n", eth_seq, nwrite);
+					if (pbuf_head->type == PACKET_TYPE_MANAGE) {
+						switch (pbuf_data[0]) {
+						case MANAGE_TYPE_ECHO:
+							process_echo_packet((ECHO_PACKET*)sock_buf, sock_recv, socks);
+							pdebug("packet was ECHO packet: replied to eth\n");
+							break;
+						}
+					}
+					else {
+						nwrite = tun_ewrite(sock_tun, pbuf_data, pbuf_head->length);
+						pdebug("packet was sent to tun seq=%d : write %lu bytes\n", eth_seq, nwrite);
+					}
 				}
 				catch (std::exception &e) {
 					perror("recvfrom / ewrite");

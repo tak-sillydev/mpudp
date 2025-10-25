@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <stdexcept>
+#include <chrono>
 
 #include "print.h"
 #include "client.h"
 #include "ringbuf.h"
+
+using std::chrono::system_clock;
 
 namespace client {
 	bool getaddress(const char* dst_addr, const int dst_port, addrinfo **result) {
@@ -76,6 +79,54 @@ namespace client {
 		return true;
 	}
 
+	// １秒おきに各ソケットにECHOパケットを流す
+	std::unique_ptr<std::thread> send_echo_thread(std::vector<SOCKET_PACK>& socks) {
+		return std::unique_ptr<std::thread>(new std::thread([&](){
+			ECHO_PACKET	echo;
+			ssize_t	nwrite;
+			uint32_t echo_seq = 0;
+			uint32_t eth_seq_temp = 100000;
+
+			echo.tun_header.length = sizeof(ECHO_PACKET) - sizeof(TUN_HEADER);
+			echo.tun_header.mode = MODE_SPEED;
+			echo.tun_header.type = PACKET_TYPE_MANAGE;
+
+			while (true) {
+				for (auto& s : socks) {
+					echo.tun_header.device_id = s.sock_fd;
+					echo.tun_header.seq = eth_seq_temp++;
+					echo.type = MANAGE_TYPE_ECHO;
+					echo.seq  = echo_seq;
+
+					echo.tm_start = system_clock::now();
+
+					nwrite = sendto(
+						s.sock_fd, &echo, sizeof(echo), 0,
+						(sockaddr*)&(s.remote_addr), sizeof(s.remote_addr)
+					);
+					if (nwrite < 0) {
+						perror("send_echo: sendto");
+						print_error("errno = %d\n", errno);
+					}
+					echo_seq++;
+				}
+				sleep(1);
+			}
+		}));
+	}
+
+	void process_echo_packet(const ECHO_PACKET *echo) {
+		using namespace std::chrono;
+
+		auto diff_us = duration_cast<microseconds>(system_clock::now() - echo->tm_start);
+
+		pdebug(
+			"THIS IS ECHO PACKET: device_id = %d, seq = %d, RTT = %d.%dms\n",
+			echo->tun_header.device_id, echo->seq, diff_us / 1000, diff_us % 1000
+		);
+		return;
+	}
+
 	/*
 	 * クライアントモード
 	 * クライアントモードモードでは、socks の各要素はそれぞれの eth デバイスに割り当てられたソケット
@@ -142,7 +193,8 @@ namespace client {
 					pdebug_tunrecv(tun_seq, nread, pbuf_data);
 					tun_seq++;
 
-					pbuf_head->mode = (char)MODE_SPEED;
+					pbuf_head->mode = MODE_SPEED;
+					pbuf_head->type = PACKET_TYPE_GENERAL;
 					pbuf_head->device_id = (unsigned char)(socks_it->sock_fd & 0xff);	// 雑だなぁ
 					pbuf_head->length = (unsigned short)nread;	// データ ペイロード長
 					pbuf_head->seq = 0;
@@ -203,9 +255,20 @@ namespace client {
 						if (pbuf_head->mode == MODE_STABLE) {
 							const auto it = std::find(seq_rec.begin(), seq_rec.end(), pbuf_head->seq);
 
+							pdebug("seq = %d\n", pbuf_head->seq);
+
 							if (it != seq_rec.end()) {
 								pdebug("packet was already received: skip.\n");
 								eth_seq++;
+								continue;
+							}
+							if (pbuf_head->type == PACKET_TYPE_MANAGE) {
+								switch(pbuf_data[0]) {
+								case MANAGE_TYPE_ECHO:
+									process_echo_packet((ECHO_PACKET*)sock_buf);
+									break;
+								}
+								seq_rec.push(pbuf_head->seq);
 								continue;
 							}
 							seq_rec.push(pbuf_head->seq);

@@ -18,24 +18,44 @@
 #include <string>
 #include <stdexcept>
 #include <vector>
+#include <chrono>
 
 #define	max(a, b)	(((a) > (b)) ? (a) : (b))
 
 #define	BUFSIZE		2048
 
-enum {
+#define	PACKET_TYPE_GENERAL	0
+#define	PACKET_TYPE_MANAGE	1
+
+typedef enum _MANAGE_TYPE {
+	MANAGE_TYPE_ECHO
+} MANAGE_TYPE;
+
+typedef enum _TRANSMIT_MODE {
 	MODE_SPEED,
 	MODE_STABLE
-};
+} TRANSMIT_MODE;
 
 // パケット転送に関わる情報（8バイト）
 // 転送される各パケットの前に付加される
 typedef struct {
-	char	mode;
-	unsigned char	device_id;	// Ethernetデバイスに振られるID（実際にはソケットのFD）
-	unsigned short	length;		// データペイロード長
-	unsigned int	seq;		// シーケンス（MODE = SPEED / STABLEで扱いが異なる）
+	uint8_t		mode: 7;	// TRANSMIT_MODE を参照
+	uint8_t		type: 1;	// 0 = 一般パケット、1 = 管理用パケット
+	uint8_t		device_id;	// Ethernetデバイスに振られるID（実際にはソケットのFD）
+	uint16_t	length;		// データペイロード長
+	uint32_t	seq;		// シーケンス（MODE = SPEED / STABLEで扱いが異なる）
 } TUN_HEADER;
+
+using std::chrono::system_clock;
+
+typedef struct {
+	TUN_HEADER	tun_header;
+	uint8_t		type;
+	uint8_t		rsvd[3];
+	uint32_t	seq;
+	system_clock::time_point	tm_start;
+} ECHO_PACKET;
+
 
 typedef struct _SOCKET_PACK {
 	int			sock_fd;
@@ -75,13 +95,17 @@ typedef struct _SOCKET_PACK {
 	}
 } SOCKET_PACK;
 
-class SocketManager {
+class MPUDPTunnel {
 private:
 	std::vector<SOCKET_PACK>	socks;
 
 public:
 	virtual bool setup(int& max_fd, const char* addr, const int port);
 };
+
+class MPUDPTunnelServer : public MPUDPTunnel {};
+
+class MPUDPTunnelClient : public MPUDPTunnel {};
 
 bool is_same_addr(const sockaddr_in& a, const sockaddr_in& b);
 int tun_alloc(char *device_name);

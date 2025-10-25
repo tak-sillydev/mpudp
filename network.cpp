@@ -73,4 +73,3 @@ int tun_readn(int fd, void *buf, int n) {
 	}
 	return n;
 }
-
