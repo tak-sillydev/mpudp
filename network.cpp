@@ -7,7 +7,7 @@ bool is_same_addr(const sockaddr_in& a, const sockaddr_in& b) {
 			a.sin_family == b.sin_family;
 }
 
-int tun_alloc(char *device_name) {
+int tun_alloc(const char *device_name) {
 	struct ifreq	ifr;
 	const char		*clone_device = "/dev/net/tun";
 	int		fd, err;
@@ -34,17 +34,17 @@ int tun_alloc(char *device_name) {
 		print_error("errno = %d\n", errno);
 		return err;
 	}
-	strcpy(device_name, ifr.ifr_name);	// これはなに？
+	//strcpy(device_name, ifr.ifr_name);	// これはなに？
 	return fd;
 }
 
 int tun_eread(int fd, void *buf, int n) {
 	int nread;
 
-	if ((nread = read(fd, buf, n)) < 0) {
+	if ((nread = read(fd, buf, n)) <= 0) {
 		perror("Reading from socket");
 		print_error("errno = %d\n", errno);
-		throw std::runtime_error("nread smaller than zero");
+		throw std::runtime_error("nread returned below or equal to zero");
 	}
 	return nread;
 }

@@ -1,74 +1,77 @@
 #include <algorithm>
-#include <stdexcept>
-#include <chrono>
 
-#include "print.h"
-#include "client.h"
+#include <sys/types.h>
+#include <netdb.h>
+
 #include "ringbuf.h"
+#include "print.h"
+#include "mpudp.h"
 
-using std::chrono::system_clock;
+bool MPUDPTunnelClient::_GetAddressInfo(const std::string& dst_addr, const int dst_port, addrinfo **result) {
+	char		port_str[16];
+	addrinfo	hints;
+	int			err;
 
-namespace client {
-	bool getaddress(const char* dst_addr, const int dst_port, addrinfo **result) {
-		char		port_str[16];
-		addrinfo	hints;
-		int			err;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family		= AF_INET;
+	hints.ai_socktype	= SOCK_DGRAM;
 
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_family		= AF_INET;
-		hints.ai_socktype	= SOCK_DGRAM;
-
-		sprintf(port_str, "%hu", dst_port);
-		if ((err = getaddrinfo(dst_addr, port_str, &hints, result)) < 0) {
-			perror("getaddrinfo()");
-			print_error("err = %d, reason = %s\n", err, gai_strerror(err));
-			print_error("errno = %d\n", errno);
-			return false;
-		}
-		return true;
+	sprintf(port_str, "%hu", dst_port);
+	if ((err = getaddrinfo(dst_addr.c_str(), port_str, &hints, result)) < 0) {
+		perror("getaddrinfo()");
+		print_error("err = %d, reason = %s\n", err, gai_strerror(err));
+		print_error("errno = %d\n", errno);
+		return false;
 	}
+	return true;
+}
 
-	bool setup(SOCKET_PACK& s, std::string& device_name, const addrinfo* pai) {
+bool MPUDPTunnelClient::Start(const std::string& tun_name, const std::string& addr, const int port) {
+	addrinfo	*ai;
+	socklen_t	szaddr;
+	int			optval = 1;
+
+	if (!this->SetTunDevice(tun_name.c_str())) { return false; }
+	if (!this->_GetAddressInfo(addr, port, &ai)) { return false; }
+
+	szaddr = ai->ai_addrlen;
+
+	for (auto& s : this->socks) {
 		// 使用する実デバイスにソケットを割り当てる
 		// ソケットの作成とオプションの設定
-		socklen_t	szaddr = sizeof(sockaddr_in);
-		int			optval = 1;
 
-		if ((s.sock_fd = socket(pai->ai_family, pai->ai_socktype, pai->ai_protocol)) < 0) {
+		if ((s.sock_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) < 0) {
 			perror("socket()");
-			print_error("Couldn't create socket - %s\n", device_name.c_str());
+			print_error("Couldn't create socket - %s\n", s.eth_name.c_str());
 			print_error("errno = %d\n", errno);
 			return false;
 		}
 		if (setsockopt(s.sock_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
 			perror("setsockopt()");
-			print_error("Couldn't set value of SO_REUSEASSR - %s\n", device_name.c_str());
+			print_error("Couldn't set value of SO_REUSEASSR - %s\n", s.eth_name.c_str());
 			print_error("errno = %d\n", errno);
 			return false;
 		}
-		if (setsockopt(s.sock_fd, SOL_SOCKET, SO_BINDTODEVICE, device_name.c_str(), device_name.length()) < 0) {
+		if (setsockopt(s.sock_fd, SOL_SOCKET, SO_BINDTODEVICE, s.eth_name.c_str(), s.eth_name.length()) < 0) {
 			perror("setsockopt()");
-			print_error("Couldn't set value of SO_BINDTODEVICE - %s\n", device_name.c_str());
+			print_error("Couldn't set value of SO_BINDTODEVICE - %s\n", s.eth_name.c_str());
 			print_error("errno = %d\n", errno);
 			return false;
 		}
-
 		// 接続先の設定
-		if (connect(s.sock_fd, pai->ai_addr, pai->ai_addrlen) < 0) {
+		if (connect(s.sock_fd, ai->ai_addr, ai->ai_addrlen) < 0) {
 			perror("connect()");
 			print_error("device = %s, errno = %d\n", s.eth_name.c_str(), errno);
 			return false;
 		}
-		s.remote_addr = *(sockaddr_in *)pai->ai_addr;
+		s.remote_addr = *(sockaddr_in *)ai->ai_addr;
 
 		// ローカル側で使用するポートの割当
-		s.local_addr.sin_family			= AF_INET;
+		s.local_addr.sin_family			= ai->ai_family;
 		s.local_addr.sin_addr.s_addr	= htonl(INADDR_ANY);
 		s.local_addr.sin_port			= htons(0);
-		bind(s.sock_fd, (sockaddr*)&(s.local_addr), sizeof(sockaddr));
+		bind(s.sock_fd, (sockaddr*)&(s.local_addr), sizeof(s.local_addr));
 		getsockname(s.sock_fd, (sockaddr*)&(s.local_addr), &szaddr);	// bind() によって使用ポートが割り当てられたので情報を取得
-
-		s.eth_name = device_name;
 
 		pdebug("eth[%s]: fd: %d, local addr: %s, port: %d\n",
 			s.eth_name.c_str(),
@@ -76,216 +79,176 @@ namespace client {
 			inet_ntoa(s.local_addr.sin_addr),
 			ntohs(s.local_addr.sin_port)
 		);
-		return true;
 	}
+	return true;
+}
 
-	// １秒おきに各ソケットにECHOパケットを流す
-	std::unique_ptr<std::thread> send_echo_thread(std::vector<SOCKET_PACK>& socks) {
-		return std::unique_ptr<std::thread>(new std::thread([&](){
-			ECHO_PACKET	echo;
-			ssize_t	nwrite;
-			uint32_t echo_seq = 0;
-			uint32_t eth_seq_temp = 100000;
+void MPUDPTunnelClient::AddDevice(const std::string& device_name) {
+	SOCKET_PACK	s;
 
-			echo.tun_header.length = sizeof(ECHO_PACKET) - sizeof(TUN_HEADER);
-			echo.tun_header.mode = MODE_SPEED;
-			echo.tun_header.type = PACKET_TYPE_MANAGE;
+	s.eth_name = device_name;
+	this->socks.emplace_back(std::move(s));
+	return;
+}
 
-			while (true) {
-				for (auto& s : socks) {
-					echo.tun_header.device_id = s.sock_fd;
-					echo.tun_header.seq = eth_seq_temp++;
-					echo.type = MANAGE_TYPE_ECHO;
-					echo.seq  = echo_seq;
-
-					echo.tm_start = system_clock::now();
-
-					nwrite = sendto(
-						s.sock_fd, &echo, sizeof(echo), 0,
-						(sockaddr*)&(s.remote_addr), sizeof(s.remote_addr)
-					);
-					if (nwrite < 0) {
-						perror("send_echo: sendto");
-						print_error("errno = %d\n", errno);
-					}
-					echo_seq++;
-				}
-				sleep(1);
-			}
-		}));
-	}
-
-	void process_echo_packet(const ECHO_PACKET *echo) {
-		using namespace std::chrono;
-
-		auto diff_us = duration_cast<microseconds>(system_clock::now() - echo->tm_start);
-
-		pdebug(
-			"THIS IS ECHO PACKET: device_id = %d, seq = %d, RTT = %d.%dms\n",
-			echo->tun_header.device_id, echo->seq, diff_us / 1000, diff_us % 1000
-		);
-		return;
-	}
-
-	/*
-	 * クライアントモード
-	 * クライアントモードモードでは、socks の各要素はそれぞれの eth デバイスに割り当てられたソケット
-	 * イテレータを走査してデータを受信する
-	 */
-	bool main_loop(int sock_tun, std::vector<SOCKET_PACK>& socks) {
-		fd_set	rfds;
-		int		max_fd = -1;
-
-		int	nread, nwrite;
-		int	tun_seq = 0, eth_seq = 0;
-		
-		// データの送受信バッファ
-		uint8_t		sock_buf[sizeof(TUN_HEADER) + BUFSIZE];
-		TUN_HEADER	*pbuf_head = (TUN_HEADER*)sock_buf;
-		uint8_t		*pbuf_data = sock_buf + sizeof(TUN_HEADER);
-
-		auto socks_it = socks.begin();
-
-		/*
-		 * 受信済みのパケット番号を記録する場所
-		 * MODE_STABLE で送信されたパケットは全部の経路に同じものを流して冗長化するので、
-		 * 受信側で「すでに受信した」パケットは廃棄する必要がある。
-		 * このバッファは溢れた場合、古いものから自動的に削除される仕組み。
-		 */
-		ringbuf<decltype(pbuf_head->seq), 32>	seq_rec(-1);
-
-
-		std::for_each(
-			socks.begin(), socks.end(),
-			[&max_fd](const SOCKET_PACK& x){ max_fd = max(x.sock_fd, max_fd); }
-		);
-		max_fd = max(sock_tun, max_fd);
-		pdebug("max_fd = %d\n", max_fd);
-		pdebug("sock_tun = %d\n", sock_tun);
-		pdebug("socks = ");
-		for (const auto& s : socks) { pdebug("%d ", s.sock_fd); } pdebug("\n");
-
-		memset(sock_buf, 0, sizeof(sock_buf));
+// １秒おきに各ソケットにECHOパケットを流す
+std::unique_ptr<std::thread> MPUDPTunnelClient::_send_echo_thread() {
+	return std::unique_ptr<std::thread>(new std::thread([this](){
+		ECHO_PACKET	*echo = (ECHO_PACKET*)this->GetHeader();
+		uint32_t echo_seq = 0;
 
 		while (true) {
-			// 初期化と使用するソケットのシステム側への通知
-			FD_ZERO(&rfds);
-			FD_SET(sock_tun, &rfds);
-			for (const auto& s : socks) { FD_SET(s.sock_fd, &rfds); }
+			for (auto& s : this->socks) {
+				std::lock_guard<std::mutex>	lock(this->buf_mtx);
 
-			// データを受信するまで待機
-			if (select(max_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
-				if (errno == EINTR) continue;
+				echo->type = MANAGE_TYPE_ECHO;
+				echo->seq  = echo_seq;
+				echo->tm_start = system_clock::now();
 
-				perror("select()");
+				SendTo(s, sizeof(ECHO_PACKET) - sizeof(TUN_HEADER), PACKET_TYPE_MANAGE);
+				echo_seq++;
+			} // mutex は自動解放
+			sleep(1);
+		}
+	}));
+}
+
+void MPUDPTunnelClient::_process_echo_packet(const ECHO_PACKET *echo) {
+	using namespace std::chrono;
+
+	auto diff_us = duration_cast<microseconds>(system_clock::now() - echo->tm_start);
+
+	pdebug(
+		"THIS IS ECHO PACKET: device_id = %d, seq = %d, RTT = %d.%dms\n",
+		echo->tun_header.device_id, echo->seq, diff_us / 1000, diff_us % 1000
+	);
+	return;
+}
+
+/*
+ * クライアントモード送受ループ
+ * クライアントモードモードでは、socks の各要素はそれぞれの eth デバイスに割り当てられたソケット
+ * イテレータを走査してデータを受信する
+ */
+bool MPUDPTunnelClient::MainLoop() {
+	fd_set	rfds;
+	int		max_fd = -1;
+
+	auto socks_it = socks.begin();
+	auto phead = this->GetHeader();
+	auto pdata = this->GetDataPtr();
+
+	uint32_t	nread, nwrite;
+	uint32_t	tun_seq = 0;
+
+	/*
+	 * 受信済みのパケット番号を記録する場所
+	 * MODE_STABLE で送信されたパケットは全部の経路に同じものを流して冗長化するので、
+	 * 受信側で「すでに受信した」パケットは廃棄する必要がある。
+	 * このバッファは溢れた場合、古いものから自動的に削除される仕組み。
+	 */
+	ringbuf<decltype(GetHeader()->seq), 32>	seq_rec(-1);
+
+	std::for_each(
+		socks.begin(), socks.end(),
+		[&max_fd](const SOCKET_PACK& x){ max_fd = max(x.sock_fd, max_fd); }
+	);
+	max_fd = max(this->sock_tun, max_fd);
+
+	auto t = this->_send_echo_thread();
+
+	while (true) {
+
+		// 初期化と使用するソケットのシステム側への通知
+		FD_ZERO(&rfds);
+		FD_SET(this->sock_tun, &rfds);
+		for (const auto& s : this->socks) { FD_SET(s.sock_fd, &rfds); }
+
+		// データを受信するまで待機
+		if (select(max_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
+			if (errno == EINTR) continue;
+
+			perror("select()");
+			print_error("errno = %d\n", errno);
+			return false;
+		}
+		if (FD_ISSET(this->sock_tun, &rfds)) {
+			/* 
+			 * TUN デバイス側からデータを受信
+			 * ここに書き込まれるデータは生のIPパケット
+			 * ETH デバイスを選定してデータを書き込む（ネットワーク側に流す）
+			 */
+			try {
+				pdebug("\n===== TUN DEVICE RECEIVED DATA =====\n");
+				std::lock_guard<std::mutex>	lock(buf_mtx);	// try の間はバッファを占有
+
+				// this->data_buf にデータを書き込んでおくと勝手に運んでくれる
+				nread = tun_eread(sock_tun, pdata, BUFSIZE);
+				pdebug_tunrecv(tun_seq, nread, pdata);
+				tun_seq++;
+
+				// ラウンドロビンでデータを送る
+				// ここにパケットを効率よく分散する機構を組み込む
+				nwrite = this->SendTo(*socks_it, nread, PACKET_TYPE_GENERAL);
+				pdebug("packet was sent to eth device = %s: %lu bytes\n", socks_it->eth_name.c_str(), nwrite);
+
+				socks_it++;
+				if (socks_it == socks.cend()) { socks_it = socks.begin(); }
+			} catch (std::exception& e) {
+				perror("eread / sendto");
 				print_error("errno = %d\n", errno);
-				return false;
+				print_error("%s - the data will be discarded. Continue.\n", e.what());
 			}
-			if (FD_ISSET(sock_tun, &rfds)) {
+		}
+		for (auto& s : this->socks) {
+			if (FD_ISSET(s.sock_fd, &rfds)) {
 				/* 
-				 * TUN デバイス側からデータを受信
-				 * ここに書き込まれるデータは生のIPパケット
-				 * ETH デバイスを選定してデータを書き込む（ネットワーク側に流す）
+				 * ETH デバイス側からデータを受信
+				 * パケットサイズがMTUを超える場合、パケットは複数に分割される
+				 * この分割、また受信時の再合成の処理はより低いレイヤー（ネットワーク層）で行われるので、
+				 * UDPのレイヤでは特に考えなくて良い。ただし、パケットが遅れて到着する可能性はあるので、
+				 * 送信したバイト数を読み切るまで待機する処理が必要（ここでは readn が行う）
 				 */
 				try {
-					pdebug("\n===== TUN DEVICE RECEIVED DATA =====\n");
-					nread = tun_eread(sock_tun, (void*)pbuf_data, BUFSIZE);
-					pdebug_tunrecv(tun_seq, nread, pbuf_data);
-					tun_seq++;
+					pdebug("\n===== ETH DEVICE [%s] RECEIVED DATA =====\n", s.eth_name.c_str());
+					std::lock_guard<std::mutex>	lock(buf_mtx);	// try の間はバッファを占有
+					sockaddr_in	addr_from;
 
-					pbuf_head->mode = MODE_SPEED;
-					pbuf_head->type = PACKET_TYPE_GENERAL;
-					pbuf_head->device_id = (unsigned char)(socks_it->sock_fd & 0xff);	// 雑だなぁ
-					pbuf_head->length = (unsigned short)nread;	// データ ペイロード長
-					pbuf_head->seq = 0;
+					nread = this->RecvFrom(s, &addr_from);
 
-					// ラウンドロビンでデータを送る
-					// ここにパケットを効率よく分散する機構を組み込む
-					nwrite = sendto(
-						socks_it->sock_fd, sock_buf, nread + sizeof(TUN_HEADER), 0,
-						(sockaddr*)&socks_it->remote_addr, sizeof(socks_it->remote_addr)
-					);
-					if (nwrite < 0) { throw std::runtime_error("sendto returned an invalid value"); }
+					pdebug_ethrecv(phead->seq, nread, (uint8_t*)phead, addr_from);
 
-					pdebug("packet was sent to eth device = %s: %lu bytes\n", socks_it->eth_name.c_str(), nwrite);
+					if (phead->mode == MODE_STABLE) {
+						const auto it = std::find(seq_rec.begin(), seq_rec.end(), phead->seq);
 
-					socks_it++;
-					if (socks_it == socks.cend()) { socks_it = socks.begin(); }
-				} catch (std::exception& e) {
-					perror("eread / sendto");
-					print_error("errno = %d\n", errno);
+						pdebug("seq = %d\n", phead->seq);
+
+						if (it != seq_rec.end()) {
+							pdebug("packet was already received: skip.\n");
+							continue;
+						}
+						if (phead->type == PACKET_TYPE_MANAGE) {
+							switch(pdata[0]) {
+							case MANAGE_TYPE_ECHO:
+								this->_process_echo_packet((ECHO_PACKET*)phead);
+								break;
+							}
+							seq_rec.push(phead->seq);
+							continue;
+						}
+						seq_rec.push(phead->seq);
+					}
+					nwrite = tun_ewrite(sock_tun, pdata, phead->length);
+					pdebug("packet was sent to tun seq=%d : write %lu bytes\n", phead->seq, nwrite);
+				}
+				catch (std::exception &e) {
+					perror("recvfrom / ewrite");
+					pdebug("errno = %d\n", errno);
 					print_error("%s - the data will be discarded. Continue.\n", e.what());
 				}
 			}
-			for (auto& s : socks) {
-				if (FD_ISSET(s.sock_fd, &rfds)) {
-					/* 
-					 * ETH デバイス側からデータを受信
-					 * パケットサイズがMTUを超える場合、パケットは複数に分割される
-					 * この分割、また受信時の再合成の処理はより低いレイヤー（ネットワーク層）で行われるので、
-					 * UDPのレイヤでは特に考えなくて良い。ただし、パケットが遅れて到着する可能性はあるので、
-					 * 送信したバイト数を読み切るまで待機する処理が必要（ここでは readn が行う）
-					 */
-					sockaddr_in	addr_from;
-					socklen_t	from_len;
-					int	n;
-
-					try {
-						pdebug("\n===== ETH DEVICE [%s] RECEIVED DATA =====\n", s.eth_name.c_str());
-
-						// 最初にヘッダの部分だけをピーク（チラ見）する
-						from_len = sizeof(sockaddr_in);
-						n = recvfrom(
-							s.sock_fd, sock_buf, sizeof(TUN_HEADER),
-							MSG_PEEK, (sockaddr*)&addr_from, &from_len
-						);
-						if (n < 0) { throw std::runtime_error("recvfrom returned an invalid value"); }
-						nread = n;
-
-						// パケット分割に備え、対向側が TUN_HEADER に書き込んだデータ長を読み切るまで待機
-						n = recvfrom(
-							s.sock_fd, sock_buf, sizeof(TUN_HEADER) + pbuf_head->length,
-							MSG_WAITALL, (sockaddr*)&addr_from, &from_len
-						);
-						if (n < 0) { throw std::runtime_error("recvfrom returned an invalid value"); }
-						nread += n;
-						
-						pdebug_ethrecv(eth_seq, nread, sock_buf, addr_from);
-
-						if (pbuf_head->mode == MODE_STABLE) {
-							const auto it = std::find(seq_rec.begin(), seq_rec.end(), pbuf_head->seq);
-
-							pdebug("seq = %d\n", pbuf_head->seq);
-
-							if (it != seq_rec.end()) {
-								pdebug("packet was already received: skip.\n");
-								eth_seq++;
-								continue;
-							}
-							if (pbuf_head->type == PACKET_TYPE_MANAGE) {
-								switch(pbuf_data[0]) {
-								case MANAGE_TYPE_ECHO:
-									process_echo_packet((ECHO_PACKET*)sock_buf);
-									break;
-								}
-								seq_rec.push(pbuf_head->seq);
-								continue;
-							}
-							seq_rec.push(pbuf_head->seq);
-						}
-						nwrite = tun_ewrite(sock_tun, pbuf_data, pbuf_head->length);
-						pdebug("packet was sent to tun seq=%d : write %lu bytes\n", eth_seq, nwrite);
-						eth_seq++;
-					}
-					catch (std::exception &e) {
-						perror("recvfrom / ewrite");
-						pdebug("errno = %d\n", errno);
-						print_error("%s - the data will be discarded. Continue.\n", e.what());
-						//goto end;
-					}
-				}
-			}
 		}
-		return true;
 	}
-} // namespace client
+	t->join();
+	return true;
+}

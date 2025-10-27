@@ -10,9 +10,9 @@
 
 #include "print.h"
 #include "network.h"
-#include "client.h"
-#include "server.h"
 #include "ringbuf.h"
+
+#include "mpudp.h"
 
 using namespace std;
 
@@ -41,10 +41,7 @@ int main(int argc, char* argv[]) {
 	 * クライアントモードの時は使用するNWデバイスに対応したソケット情報を、
 	 * サーバモードの時はそれぞれの接続元に対応したソケット情報を格納する
 	 */
-	std::vector<SOCKET_PACK>	socks;
 	std::vector<std::string>	device;
-
-	socks.reserve(10);	// とりあえず10デバイス分のメモリを確保しておく
 
 	//while ((option = getopt(argc, argv, "d:t:sc:")) > 0) {
 	while ((option = getopt(argc, argv, "i:ds")) > 0) {
@@ -78,49 +75,28 @@ int main(int argc, char* argv[]) {
 		print_error("tun device name not specified\n");
 		exit(1);
 	}
-	if (mode == MODE_CLIENT && device.size() == 0) {
-		print_error("any eth device not specified\n");
-		exit(1);
-	}
-
-	int	sock_tun, sock_recv;
-
-	// TUN デバイスの確保（デバイスは事前に要セットアップ）
-	if ((sock_tun = tun_alloc(tun_name)) < 0) {
-		print_error("Couldn't connect to tun device - %s\n", tun_name);
-		exit(1);
-	}
-	pdebug("CONNECT OK - %s\n", tun_name);
-
 	if (mode == MODE_CLIENT) {
 		// クライアントモード
-		// getaddrinfo() : hints に条件を入れてアドレスやらポートを指定すると
-		// いい感じにほかのパラメータを補って res に結果を入れて返す
-		addrinfo	*res;
-
-		if (!client::getaddress(dst_addr, dst_port, &res)) { exit(1); }
-
-		for (auto& d : device) {
-			SOCKET_PACK	s;
-			if (!client::setup(s, d, res)) { freeaddrinfo(res); exit(1); }
-			socks.emplace_back(std::move(s));
+		if (device.size() == 0) {
+			print_error("any eth device not specified\n");
+			exit(1);
 		}
-		freeaddrinfo(res);
+		auto client = unique_ptr<MPUDPTunnelClient>(new MPUDPTunnelClient(BUFSIZE));
 
-		auto t = client::send_echo_thread(socks);
-		client::main_loop(sock_tun, socks);
+		if (!client) { exit(1); }
 
-		t->join();
+		for (auto& d : device) { client->AddDevice(d); }
+		
+		if (!client->Connect(tun_name, dst_addr, dst_port)) { exit(1); };
+		if (!client->MainLoop()) { exit(1); }
 	}
 	else {
 		// サーバーモード
-		if (!server::setup(sock_recv, dst_port)) { exit(1); }
-		if (!server::main_loop(sock_tun, sock_recv, socks)) {
-			close(sock_recv);
-		}
-	}
-	close(sock_tun);
-	socks.clear();
+		auto server = unique_ptr<MPUDPTunnelServer>(new MPUDPTunnelServer(BUFSIZE));
 
+		if (!server) { exit(1); }
+		if (!server->Listen(tun_name, dst_port)) { exit(1); }
+		if (!server->MainLoop()) { exit(1); }
+	}
 	return 0;
 }

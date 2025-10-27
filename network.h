@@ -95,20 +95,8 @@ typedef struct _SOCKET_PACK {
 	}
 } SOCKET_PACK;
 
-class MPUDPTunnel {
-private:
-	std::vector<SOCKET_PACK>	socks;
-
-public:
-	virtual bool setup(int& max_fd, const char* addr, const int port);
-};
-
-class MPUDPTunnelServer : public MPUDPTunnel {};
-
-class MPUDPTunnelClient : public MPUDPTunnel {};
-
 bool is_same_addr(const sockaddr_in& a, const sockaddr_in& b);
-int tun_alloc(char *device_name);
+int tun_alloc(const char *device_name);
 int tun_eread(int fd, void *buf, int n);
 int tun_ewrite(int fd, void *buf, int n);
 int tun_readn(int fd, void *buf, int n);
