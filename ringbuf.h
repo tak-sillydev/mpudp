@@ -1,3 +1,6 @@
+#ifndef	__RINGBUF_H__
+#define	__RINGBUF_H__
+
 #include <array>
 #include <stdexcept>
 
@@ -35,3 +38,5 @@ public:
 		return ret;
 	}
 };
+
+#endif

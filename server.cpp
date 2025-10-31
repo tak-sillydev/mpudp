@@ -2,43 +2,131 @@
 
 #include "mpudp.h"
 
-// addrは無視される
-bool MPUDPTunnelServer::Start(const std::string& tun_name, const std::string& addr, const int port) {
-	sockaddr_in	local_addr;
-	socklen_t	szaddr = sizeof(local_addr);
-	int			optval = 1;
+bool MPUDPTunnelServer::_SetupSocket(int& sock_fd, int listen_port) {
+	sockaddr_in	listen_addr;
+	socklen_t	addr_len = sizeof(listen_addr);
+	int		optval = 1;
 
-	if (!this->SetTunDevice(tun_name.c_str())) { return false; }
-
-	// ソケットの作成とオプションの設定
-	if ((this->sock_recv = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+	if ((sock_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 		perror("socket()");
 		print_error("Couldn't create socket\n");
 		print_error("errno = %d\n", errno);
 		return false;
 	}
-	if (setsockopt(this->sock_recv, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+	if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
 		perror("setsockopt()");
 		print_error("Couldn't set value of SO_REUSEASSR\n");
 		print_error("errno = %d\n", errno);
 		return false;
 	}
-	memset(&local_addr, 0, sizeof(local_addr));
-	local_addr.sin_family		= AF_INET;
-	local_addr.sin_addr.s_addr	= htonl(INADDR_ANY);
-	local_addr.sin_port			= htons(port);
+	memset(&listen_addr, 0, sizeof(listen_addr));
+	listen_addr.sin_family		= AF_INET;
+	listen_addr.sin_addr.s_addr	= htonl(INADDR_ANY);
+	listen_addr.sin_port		= htons(listen_port);
 
-	if (bind(this->sock_recv, (sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+	if (bind(sock_fd, (sockaddr*)&listen_addr, sizeof(listen_addr)) < 0) {
 		perror("bind()");
 		print_error("errno = %d\n", errno);
 		return false;
 	}
-	getsockname(this->sock_recv, (sockaddr*)&local_addr, &szaddr);
+	getsockname(sock_fd, (sockaddr*)&listen_addr, &addr_len);
 	pdebug("eth: addr: %s, port: %d\n",
-		inet_ntoa(local_addr.sin_addr),
-		ntohs(local_addr.sin_port)
+		inet_ntoa(listen_addr.sin_addr),
+		ntohs(listen_addr.sin_port)
 	);
 	return true;
+}
+
+// addrは無視される
+bool MPUDPTunnelServer::Start(const std::string& tun_name, const int port) {
+	if (!this->SetTunDevice(tun_name.c_str())) { return false; }
+
+	// ソケットの作成とオプションの設定
+	if (!this->_SetupSocket(this->sock_recv, port)) { return false; }
+	
+	this->th_echo = this->_StartEchoThread();
+	return true;
+}
+
+std::unique_ptr<std::thread> MPUDPTunnelServer::_StartEchoThread() {
+#define	perror_th(s)				perror("[ECHO_THREAD] " s)
+#define	print_error_th(format, ...)	print_error(("[ECHO_THREAD] " format), ## __VA_ARGS__)
+#define	pdebug_th(format, ...)		pdebug(("[ECHO_THREAD] " format), ## __VA_ARGS__)
+
+	return std::unique_ptr<std::thread>(new std::thread([this](){
+		sockaddr_in	addr_from;
+		socklen_t	addr_len = sizeof(addr_from);
+		ssize_t		n;
+		fd_set		rfds;
+		int			sock_manage;
+
+		std::unique_ptr<ECHO_PACKET>	buf(new ECHO_PACKET);
+		std::vector<CONNECTIONS>		conns;
+
+		// TODO エラー処理
+		this->_SetupSocket(sock_manage, PORT_PING);
+
+		while (true) {
+			FD_ZERO(&rfds);
+			FD_SET(sock_manage, &rfds);
+
+			// データ到着まで待機
+			if (select(sock_manage + 1, &rfds, NULL, NULL, NULL) < 0) {
+				if (errno == EINTR) continue;
+
+				perror_th("select()");
+				print_error_th("errno = %d\n", errno);
+				return false;
+			}
+			if (FD_ISSET(sock_manage, &rfds)) {
+				n = recvfrom(
+						sock_manage, buf.get(), sizeof(ECHO_PACKET),
+						MSG_WAITALL, (sockaddr*)&addr_from, &addr_len
+					);
+				if (n < 0) {
+					perror_th("recvfrom returned error");
+					continue;
+				}
+				if (strncmp(buf->header.signature, SIGNATURE_MANAGEMENT, sizeof(buf->header.signature)) != 0) {
+					pdebug_th("signature is not valid\n");
+					continue;
+				}
+				if (strncmp(buf->signature, SIGNATURE_ECHO, sizeof(buf->signature)) != 0) {
+					pdebug_th("signature is not valid\n");
+					continue;
+				}
+				const auto it = std::find_if(conns.begin(), conns.end(),
+					[&](const CONNECTIONS& c){ return buf->header.device_id == c.device_id; }
+				);
+				if (it != conns.end()) {
+					// 前に同じデバイスIDから接続されたことがあるので情報を更新
+					it->addr = addr_from;
+					it->connected_time = system_clock::now();
+				}
+				else {
+					// 初めてのデバイスIDからなので情報を追加
+					CONNECTIONS	c = { system_clock::now(), addr_from, buf->header.device_id };
+					conns.emplace_back(std::move(c));
+				}
+				for (const auto& c : conns) {
+					n = sendto(
+						sock_manage, buf.get(), sizeof(ECHO_PACKET), 0,
+						(sockaddr*)&c.addr, sizeof(c.addr)
+					);
+					if (n < 0) {
+						perror_th("sendto");
+						print_error_th(
+							"FAILED reply echo : %s:%d\n",
+							inet_ntoa(c.addr.sin_addr), ntohs(c.addr.sin_port)
+						);
+					}
+				}
+			}
+		}
+	}));
+#undef	perror_th
+#undef	print_error_th
+#undef	pdebug_th
 }
 
 ssize_t MPUDPTunnelServer::RecvFrom(sockaddr_in *addr_from) {
@@ -153,14 +241,6 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from) {
 	return;
 }
 
-void MPUDPTunnelServer::_process_echo_packet() {
-	ECHO_PACKET	*echo = (ECHO_PACKET*)this->GetHeader();
-
-	pdebug("device_id = %d, seq = %d, time = %ld\n", echo->tun_header.device_id, echo->seq, echo->tm_start);
-	this->SendToAllDevices(sizeof(ECHO_PACKET) - sizeof(TUN_HEADER), PACKET_TYPE_MANAGE);
-	return;
-}
-
 /*
  * サーバーモード
  * サーバーモードでは、ソケットリストは経路情報だけを格納するものとして用い、
@@ -202,7 +282,7 @@ bool MPUDPTunnelServer::MainLoop() {
 				tun_seq++;
 
 				// それぞれのソケットリストに書かれたアドレスへパケットを送信
-				nwrite = this->SendToAllDevices(nread, PACKET_TYPE_GENERAL);
+				nwrite = this->SendToAllDevices(nread);
 				if (nwrite == 0) {
 					pdebug("No connection exists\n");
 				}
@@ -224,20 +304,10 @@ bool MPUDPTunnelServer::MainLoop() {
 				nread = this->RecvFrom(&addr_from);
 				this->_RefreshConnection(addr_from);
 
-				pdebug_ethrecv(phead->seq, nread, (uint8_t*)phead, addr_from);
+				pdebug_ethrecv(phead->seq_all, nread, (uint8_t*)phead, addr_from);
 
-				if (phead->type == PACKET_TYPE_MANAGE) {
-					switch (pdata[0]) {
-					case MANAGE_TYPE_ECHO:
-						this->_process_echo_packet();
-						pdebug("packet was ECHO packet: replied to eth\n");
-						break;
-					}
-				}
-				else {
-					nwrite = tun_ewrite(sock_tun, pdata, phead->length);
-					pdebug("packet was sent to tun seq=%d : write %lu bytes\n", phead->seq, nwrite);
-				}	
+				nwrite = tun_ewrite(sock_tun, pdata, phead->length);
+				pdebug("packet was sent to tun seq=%d : write %lu bytes\n", phead->seq_all, nwrite);
 			}
 			catch (std::exception &e) {
 				perror("recvfrom / ewrite");

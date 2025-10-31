@@ -22,48 +22,63 @@
 
 #define	max(a, b)	(((a) > (b)) ? (a) : (b))
 
-#define	BUFSIZE		2048
-
-#define	PACKET_TYPE_GENERAL	0
-#define	PACKET_TYPE_MANAGE	1
-
-typedef enum _MANAGE_TYPE {
-	MANAGE_TYPE_ECHO
-} MANAGE_TYPE;
-
 typedef enum _TRANSMIT_MODE {
 	MODE_SPEED,
 	MODE_STABLE
 } TRANSMIT_MODE;
 
-// パケット転送に関わる情報（8バイト）
+// パケット転送に関わる情報（16バイト）
 // 転送される各パケットの前に付加される
 typedef struct {
-	uint8_t		mode: 7;	// TRANSMIT_MODE を参照
-	uint8_t		type: 1;	// 0 = 一般パケット、1 = 管理用パケット
+	uint8_t		mode;		// TRANSMIT_MODE を参照
 	uint8_t		device_id;	// Ethernetデバイスに振られるID（実際にはソケットのFD）
 	uint16_t	length;		// データペイロード長
-	uint32_t	seq;		// シーケンス（MODE = SPEED / STABLEで扱いが異なる）
+	uint32_t	seq_all;	// 全体シーケンス：同じ番号は同じパケットであることを示す
+
+	uint32_t	seq_dev;	// デバイスシーケンス：同じデバイス上でパケットの連続性を示す
+	uint32_t	reserved;
 } TUN_HEADER;
 
-using std::chrono::system_clock;
 
-typedef struct {
-	TUN_HEADER	tun_header;
-	uint8_t		type;
-	uint8_t		rsvd[3];
-	uint32_t	seq;
-	system_clock::time_point	tm_start;
+#define		SIGNATURE_MANAGEMENT	"Mnge"
+
+// 16バイト
+typedef struct _MANAGEMENT_PACKET {
+	int64_t	seq;
+	int32_t	device_id;
+	char	signature[4];	// length of SIGNATURE_MANAGEMENT
+
+	_MANAGEMENT_PACKET() {
+		for (size_t i = 0; i < strlen(SIGNATURE_MANAGEMENT); i++) {
+			signature[i] = SIGNATURE_MANAGEMENT[i];
+		}
+	}
+} MANAGEMENT_PAKCET;
+
+
+#define	SIGNATURE_ECHO	"Echo"
+
+typedef struct _ECHO_PACKET {
+	MANAGEMENT_PAKCET	header;
+	std::chrono::system_clock::time_point	tm_start;
+	uint8_t		rsvd[4];
+	char		signature[4];
+
+	_ECHO_PACKET() {
+		for (size_t i = 0; i < strlen(SIGNATURE_ECHO); i++) {
+			signature[i] = SIGNATURE_ECHO[i];
+		}
+	}
 } ECHO_PACKET;
 
-
 typedef struct _SOCKET_PACK {
-	int			sock_fd;
+	int			sock_fd;		// == device_id
 	sockaddr_in	remote_addr;
 	sockaddr_in	local_addr;
 	std::string	eth_name;
+	uint32_t	seq_dev;
 
-	explicit _SOCKET_PACK() : sock_fd(-1) {}
+	explicit _SOCKET_PACK() : sock_fd(-1), seq_dev(0) {}
 	~_SOCKET_PACK() {
 		if (sock_fd != -1) { close(sock_fd); }
 	}
@@ -78,6 +93,7 @@ typedef struct _SOCKET_PACK {
 		local_addr	= old.local_addr;
 		eth_name	= old.eth_name;
 		sock_fd		= old.sock_fd;
+		seq_dev		= old.seq_dev;
 		old.sock_fd = -1;
 	}
 
@@ -89,6 +105,7 @@ typedef struct _SOCKET_PACK {
 			local_addr	= old.local_addr;
 			eth_name	= old.eth_name;
 			sock_fd		= old.sock_fd;
+			seq_dev		= old.seq_dev;
 			old.sock_fd = -1;
 		}
 		return *this;

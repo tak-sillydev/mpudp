@@ -14,9 +14,6 @@
 
 #include "mpudp.h"
 
-using namespace std;
-
-
 #define	MODE_SERVER	0
 #define	MODE_CLIENT	1
 
@@ -42,33 +39,29 @@ int main(int argc, char* argv[]) {
 	 * サーバモードの時はそれぞれの接続元に対応したソケット情報を格納する
 	 */
 	std::vector<std::string>	device;
+	std::string	dst_addr;
 
 	//while ((option = getopt(argc, argv, "d:t:sc:")) > 0) {
-	while ((option = getopt(argc, argv, "i:ds")) > 0) {
+	while ((option = getopt(argc, argv, "i:a:ds")) > 0) {
 		switch (option) {
 		case 'i':
-			device.emplace_back(optarg);
-			break;
+			device.emplace_back(optarg); break;
 
 		case 'd':
-			_global_fDebug = true;
-			break;
+			_global_fDebug = true; break;
 
 		case 't':
 			break;
 		
 		case 's':
-			mode = MODE_SERVER;
-			break;
+			mode = MODE_SERVER; break;
 
-		case 'c':
-			break;
+		case 'a':
+			dst_addr = optarg; break;
 		}
 	}
 	char	tun_name[64] = "tun_test";		// データを受け取る tun デバイス
-
-	const char	*dst_addr	= "163.44.119.43";
-	const int	dst_port	= 45555;
+	const int	dst_port = PORT_MAIN;
 
 	// エラーチェック
 	if (*tun_name == '\0') {
@@ -81,7 +74,11 @@ int main(int argc, char* argv[]) {
 			print_error("any eth device not specified\n");
 			exit(1);
 		}
-		auto client = unique_ptr<MPUDPTunnelClient>(new MPUDPTunnelClient(BUFSIZE));
+		if (dst_addr.length() == 0) {
+			print_error("destination address not specified\n");
+			exit(1);
+		}
+		auto client = std::unique_ptr<MPUDPTunnelClient>(new MPUDPTunnelClient(BUFSIZE));
 
 		if (!client) { exit(1); }
 
@@ -92,7 +89,7 @@ int main(int argc, char* argv[]) {
 	}
 	else {
 		// サーバーモード
-		auto server = unique_ptr<MPUDPTunnelServer>(new MPUDPTunnelServer(BUFSIZE));
+		auto server = std::unique_ptr<MPUDPTunnelServer>(new MPUDPTunnelServer(BUFSIZE));
 
 		if (!server) { exit(1); }
 		if (!server->Listen(tun_name, dst_port)) { exit(1); }
