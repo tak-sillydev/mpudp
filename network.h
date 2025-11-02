@@ -65,11 +65,23 @@ typedef struct _ECHO_PACKET {
 	char		signature[4];
 
 	_ECHO_PACKET() {
-		for (size_t i = 0; i < strlen(SIGNATURE_ECHO); i++) {
-			signature[i] = SIGNATURE_ECHO[i];
-		}
+		for (size_t i = 0; i < strlen(SIGNATURE_ECHO); i++) { signature[i] = SIGNATURE_ECHO[i];	}
 	}
 } ECHO_PACKET;
+
+#define	SIGNATURE_STAT	"Stat"
+
+typedef struct _STAT_PACKET {
+	MANAGEMENT_PAKCET	header;
+	int32_t		rcvd_bytes;
+	uint		loss_packets;
+	uint		rcvd_packets;
+	char	signature[4];
+
+	_STAT_PACKET() {
+		for (size_t i = 0; i < strlen(SIGNATURE_STAT); i++) { signature[i] = SIGNATURE_STAT[i];	}
+	}
+} STAT_PACKET;
 
 typedef struct _SOCKET_PACK {
 	int			sock_fd;		// == device_id
@@ -77,6 +89,7 @@ typedef struct _SOCKET_PACK {
 	sockaddr_in	local_addr;
 	std::string	eth_name;
 	uint32_t	seq_dev;
+	uint32_t	device_id;
 
 	explicit _SOCKET_PACK() : sock_fd(-1), seq_dev(0) {}
 	~_SOCKET_PACK() {

@@ -60,20 +60,46 @@ public:
 
 
 using std::chrono::system_clock;
+
+// 接続元情報（マネージスレッドで使う）
 typedef struct _CONNECTIONS {
 	system_clock::time_point	connected_time;
-	sockaddr_in		addr;
+	sockaddr_in	addr;
 	int32_t		device_id;
+
+	_CONNECTIONS() : connected_time(system_clock::now()) {}
 } CONNECTIONS;
+
+// 接続元情報＋統計情報（メインスレッドで使う）
+typedef struct _CONNECTIONS_STATS : public CONNECTIONS {
+	int32_t		rcvd_bytes;
+	uint32_t	last_seq;
+	uint		loss_packets;
+	uint		rcvd_packets;
+	ringbuf<int32_t, 256>	loss_buf;
+
+	_CONNECTIONS_STATS() :
+		rcvd_bytes(0), last_seq(0), loss_packets(0), rcvd_packets(0) {
+		loss_buf.fill(-1);
+	}
+
+	void reset() {
+		rcvd_bytes = 0;
+		loss_packets = 0;
+		rcvd_packets = 0;
+		loss_buf.fill(-1);
+	}
+} CONNECTIONS_STATS;
 
 class MPUDPTunnelServer : public MPUDPTunnel {
 private:
-	std::vector<CONNECTIONS>	connection_list;
-	int sock_recv;
+	std::vector<CONNECTIONS_STATS>	connection_list;
+	std::mutex	conn_mtx;
+	int			sock_recv;
 
 	bool Start(const std::string& tun_name, const int port);
 	bool _SetupSocket(int& sock_fd, int listen_port);
-	void _RefreshConnection(sockaddr_in& addr_from);
+	void _RefreshConnection(sockaddr_in& addr_from, int nrecv);
 
 	std::unique_ptr<std::thread> _StartEchoThread();
 

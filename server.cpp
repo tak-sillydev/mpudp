@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <limits>
 
 #include "mpudp.h"
 
@@ -53,50 +54,88 @@ std::unique_ptr<std::thread> MPUDPTunnelServer::_StartEchoThread() {
 #define	print_error_th(format, ...)	print_error(("[ECHO_THREAD] " format), ## __VA_ARGS__)
 #define	pdebug_th(format, ...)		pdebug(("[ECHO_THREAD] " format), ## __VA_ARGS__)
 
+	using namespace std::chrono;
+
 	return std::unique_ptr<std::thread>(new std::thread([this](){
 		sockaddr_in	addr_from;
 		socklen_t	addr_len = sizeof(addr_from);
+		timeval		tv = { 1, 0 };
 		ssize_t		n;
 		fd_set		rfds;
-		int			sock_manage;
+		int			sock_manage, selret;
 
-		std::unique_ptr<ECHO_PACKET>	buf(new ECHO_PACKET);
-		std::vector<CONNECTIONS>		conns;
+		std::unique_ptr<ECHO_PACKET>	echo_buf(new ECHO_PACKET);
+		std::unique_ptr<STAT_PACKET>	stat_buf(new STAT_PACKET);
+		std::vector<CONNECTIONS>		conns;	// this->connection_list と同じにはできない：送信元ポートが異なる
 
 		// TODO エラー処理
 		this->_SetupSocket(sock_manage, PORT_PING);
+		stat_buf->header.seq = INT64_MAX / 2;
 
 		while (true) {
 			FD_ZERO(&rfds);
 			FD_SET(sock_manage, &rfds);
 
 			// データ到着まで待機
-			if (select(sock_manage + 1, &rfds, NULL, NULL, NULL) < 0) {
+			auto now_time = system_clock::now();
+			selret = select(sock_manage + 1, &rfds, NULL, NULL, &tv);
+
+			if (selret < 0) {
 				if (errno == EINTR) continue;
 
 				perror_th("select()");
 				print_error_th("errno = %d\n", errno);
 				return false;
 			}
+			if (selret == 0) {
+				// タイムアウト
+				std::lock_guard<std::mutex>	lock(conn_mtx);
+
+				for (auto& c : connection_list) {
+					stat_buf->header.seq++;
+					stat_buf->header.device_id = c.device_id;
+					stat_buf->loss_packets = c.loss_packets;
+					stat_buf->rcvd_packets = c.rcvd_packets;
+					stat_buf->rcvd_bytes = c.rcvd_bytes;
+
+					for (const auto& d: conns) {
+						n = sendto(
+							sock_manage, stat_buf.get(), sizeof(STAT_PACKET), 0,
+							(sockaddr*)&d.addr, sizeof(d.addr)
+						);
+						if (n < 0) {
+							perror_th("sendto");
+							print_error_th(
+								"FAILED send stats : %s:%d\n",
+								inet_ntoa(d.addr.sin_addr), ntohs(d.addr.sin_port)
+							);
+						}
+					}
+					c.reset();
+				}
+				tv.tv_sec  = 1;
+				tv.tv_usec = 0;
+				continue;
+			}
 			if (FD_ISSET(sock_manage, &rfds)) {
 				n = recvfrom(
-						sock_manage, buf.get(), sizeof(ECHO_PACKET),
+						sock_manage, echo_buf.get(), sizeof(ECHO_PACKET),
 						MSG_WAITALL, (sockaddr*)&addr_from, &addr_len
 					);
 				if (n < 0) {
 					perror_th("recvfrom returned error");
 					continue;
 				}
-				if (strncmp(buf->header.signature, SIGNATURE_MANAGEMENT, sizeof(buf->header.signature)) != 0) {
+				if (strncmp(echo_buf->header.signature, SIGNATURE_MANAGEMENT, sizeof(echo_buf->header.signature)) != 0) {
 					pdebug_th("signature is not valid\n");
 					continue;
 				}
-				if (strncmp(buf->signature, SIGNATURE_ECHO, sizeof(buf->signature)) != 0) {
+				if (strncmp(echo_buf->signature, SIGNATURE_ECHO, sizeof(echo_buf->signature)) != 0) {
 					pdebug_th("signature is not valid\n");
 					continue;
 				}
 				const auto it = std::find_if(conns.begin(), conns.end(),
-					[&](const CONNECTIONS& c){ return buf->header.device_id == c.device_id; }
+					[&](const CONNECTIONS& c){ return echo_buf->header.device_id == c.device_id; }
 				);
 				if (it != conns.end()) {
 					// 前に同じデバイスIDから接続されたことがあるので情報を更新
@@ -105,12 +144,15 @@ std::unique_ptr<std::thread> MPUDPTunnelServer::_StartEchoThread() {
 				}
 				else {
 					// 初めてのデバイスIDからなので情報を追加
-					CONNECTIONS	c = { system_clock::now(), addr_from, buf->header.device_id };
+					CONNECTIONS	c;
+
+					c.addr = addr_from;
+					c.device_id = echo_buf->header.device_id;
 					conns.emplace_back(std::move(c));
 				}
 				for (const auto& c : conns) {
 					n = sendto(
-						sock_manage, buf.get(), sizeof(ECHO_PACKET), 0,
+						sock_manage, echo_buf.get(), sizeof(ECHO_PACKET), 0,
 						(sockaddr*)&c.addr, sizeof(c.addr)
 					);
 					if (n < 0) {
@@ -122,6 +164,8 @@ std::unique_ptr<std::thread> MPUDPTunnelServer::_StartEchoThread() {
 					}
 				}
 			}
+			tv.tv_sec  = 0;
+			tv.tv_usec = (1 * 1000 * 1000) - duration_cast<microseconds>(system_clock::now() - now_time).count();
 		}
 	}));
 #undef	perror_th
@@ -159,19 +203,20 @@ ssize_t MPUDPTunnelServer::RecvFrom(sockaddr_in *addr_from) {
 
 // 今までにない経路からの通信なら返信リストに登録
 // デバイスIDが同じでも、ポート番号などアドレス情報が変わっていれば更新
-void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from) {
+void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from, int nrecv) {
 	using namespace std::chrono;
 
+	std::lock_guard<std::mutex>	lock(this->conn_mtx);
 	TUN_HEADER	*phead = this->GetHeader();
 
 	// 接続リストに今回の接続のデバイスIDで検索をかける
 	auto conn_it = std::find_if(connection_list.begin(), connection_list.end(),
-		[phead](const CONNECTIONS& c) { return phead->device_id == c.device_id; }
+		[phead](const CONNECTIONS_STATS& c) { return phead->device_id == c.device_id; }
 	);
 	// 過去に接続されたデバイスからのデータか？
 	if (conn_it == connection_list.end()) {
 		pdebug("new routes\n");
-		CONNECTIONS	c;
+		CONNECTIONS_STATS	c;
 		SOCKET_PACK	s;
 
 		s.sock_fd = this->sock_recv;
@@ -180,8 +225,10 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from) {
 
 		c.addr = addr_from;
 		c.device_id = phead->device_id;
-		c.connected_time = system_clock::now();
-		this->connection_list.emplace_back(c);
+
+		this->connection_list.emplace_back(c);	// 末尾に追加して
+		conn_it = --connection_list.end();		// そのイテレータを取る
+		conn_it->reset();
 	}
 	else {
 		// 同じデバイスIDからの接続
@@ -201,6 +248,30 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from) {
 		// 接続時間の更新
 		conn_it->connected_time = system_clock::now();
 	}
+
+	// 回線速度とパケットロス率の測定
+	if (conn_it->last_seq + 1 < phead->seq_dev) {
+		// シーケンスが飛んでいる・パケロスもしくは順序交代
+		for (uint32_t q = conn_it->last_seq + 1; q < phead->seq_dev; q++, conn_it->loss_packets++) {
+			conn_it->loss_buf.push(q);	// ロスパケットリストに追加
+		}
+	}
+	else if (phead->seq_dev < conn_it->last_seq) {
+		// 順序交代したパケットが届いた
+		auto q = std::find(conn_it->loss_buf.begin(), conn_it->loss_buf.end(), phead->seq_dev);
+		*q = -1;	// ロスパケリストから削除
+		conn_it->loss_packets--;
+	}
+	conn_it->last_seq = max(conn_it->last_seq, phead->seq_dev);
+	conn_it->rcvd_bytes += nrecv;
+	conn_it->rcvd_packets++;
+
+	pdebug(
+		"speed: %dB, rcvd = %d, loss = %d, loss.rate = %f\n",
+		conn_it->rcvd_bytes, conn_it->rcvd_packets,
+		conn_it->loss_packets, (double)conn_it->loss_packets / conn_it->rcvd_packets
+	);
+
 	// 最後に「１分以上データの飛んでこない接続元」を閉じないといけない
 	// socksをリストにした方が良いかも
 	// sock_recv のclose問題は、先にsock_fd = -1 としておけばよさそう（-1のときはcloseしない）
@@ -208,7 +279,7 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from) {
 	// 削除対象のコネクションを列挙
 	auto now = system_clock::now();
 	auto conn_end = std::remove_if(connection_list.begin(), connection_list.end(),
-		[now](const CONNECTIONS& c) {
+		[now](const CONNECTIONS_STATS& c) {
 			return duration_cast<minutes>(now - c.connected_time).count() >= 1;
 		}
 	);
@@ -219,7 +290,7 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from) {
 			// それぞれの s.remote_addr に対して
 			// 削除対象のコネクションを順に照合し、合致するものがあれば true（削除）
 			auto it = std::find_if(conn_end, connection_list.end(),
-				[&](const CONNECTIONS& c) { return is_same_addr(c.addr, s.remote_addr); }
+				[&](const CONNECTIONS_STATS& c) { return is_same_addr(c.addr, s.remote_addr); }
 			);
 			return it != connection_list.end();
 		}
@@ -302,12 +373,15 @@ bool MPUDPTunnelServer::MainLoop() {
 				sockaddr_in	addr_from;
 
 				nread = this->RecvFrom(&addr_from);
-				this->_RefreshConnection(addr_from);
 
-				pdebug_ethrecv(phead->seq_all, nread, (uint8_t*)phead, addr_from);
+				if (nread > 0) {
+					this->_RefreshConnection(addr_from, nread);
 
-				nwrite = tun_ewrite(sock_tun, pdata, phead->length);
-				pdebug("packet was sent to tun seq=%d : write %lu bytes\n", phead->seq_all, nwrite);
+					pdebug_ethrecv(phead->seq_all, nread, (uint8_t*)phead, addr_from);
+
+					nwrite = tun_ewrite(sock_tun, pdata, phead->length);
+					pdebug("packet was sent to tun seq=%d : write %lu bytes\n", phead->seq_all, nwrite);
+				}
 			}
 			catch (std::exception &e) {
 				perror("recvfrom / ewrite");

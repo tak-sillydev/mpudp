@@ -213,7 +213,29 @@ std::unique_ptr<std::thread> MPUDPTunnelClient::_StartEchoThread(const std::stri
 						continue;
 					}
 					if (strncmp(buf->signature, SIGNATURE_ECHO, sizeof(buf->signature)) != 0) {
-						pdebug_th("signature is not valid\n");
+						STAT_PACKET	*stat = (STAT_PACKET*)buf.get();
+
+						if (strncmp(stat->signature, SIGNATURE_STAT, sizeof(stat->signature)) == 0) {
+							const auto ars_it = std::find(already_recvd_seq.begin(), already_recvd_seq.end(), stat->header.seq);
+							if (ars_it != already_recvd_seq.end()) {
+								pdebug_th(
+									"sock_fd = %d, device_id = %d, seq = %d, "
+									"packet is already received. skip.\n",
+									e.echo_sock, buf->header.device_id, buf->header.seq
+								);
+								continue;
+							}
+							already_recvd_seq.push(stat->header.seq);
+							pdebug_th(
+								"sock_fd = %d, device_id = %d, seq = %d\n"
+								"  speed = %d [B/s], loss_rate = %f%%\n",
+								e.echo_sock, stat->header.device_id, stat->header.seq,
+								stat->rcvd_bytes, (double)stat->loss_packets / stat->rcvd_packets
+							);
+						}
+						else {
+							pdebug_th("signature is not valid\n");
+						}
 						continue;
 					}
 					const auto ars_it = std::find(already_recvd_seq.begin(), already_recvd_seq.end(), buf->header.seq);
