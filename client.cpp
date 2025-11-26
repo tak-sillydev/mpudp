@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <iomanip>
 
 #include <sys/types.h>
 #include <netdb.h>
@@ -6,6 +7,7 @@
 #include "ringbuf.h"
 #include "print.h"
 #include "mpudp.h"
+
 
 bool MPUDPTunnelClient::_GetAddressInfo(const std::string& dst_addr, const int dst_port, addrinfo **result) {
 	char		port_str[16];
@@ -81,214 +83,175 @@ bool MPUDPTunnelClient::Start(const std::string& tun_name, const std::string& ad
 		bind(s.sock_fd, (sockaddr*)&(s.local_addr), sizeof(s.local_addr));
 		getsockname(s.sock_fd, (sockaddr*)&(s.local_addr), &szaddr);	// bind() によって使用ポートが割り当てられたので情報を取得
 
-		pdebug("eth[%s]: fd: %d, local addr: %s, port: %d\n",
+		pdebug("eth[%s]: fd: %d, device_id = %lx, local addr: %s, port: %d\n",
 			s.eth_name.c_str(),
 			s.sock_fd,
+			s.device_id,
 			inet_ntoa(s.local_addr.sin_addr),
 			ntohs(s.local_addr.sin_port)
 		);
 	}
-	this->th_echo = this->_StartEchoThread(addr);
 	freeaddrinfo(ai);
 	return true;
 }
 
 void MPUDPTunnelClient::AddDevice(const std::string& device_name) {
 	SOCKET_PACK	s;
+	STATISTICS	st;
 
-	s.eth_name = device_name;
+	s.eth_name  = device_name;
+	s.device_id = std::hash<std::string>()(device_name);
+	
+	st.device_id = s.device_id;
+
 	this->socks.emplace_back(std::move(s));
+	this->stats.emplace_back(st);
+
 	return;
 }
 
-// １秒おきに各ソケットにECHOパケットを流す（およそラムダ関数で処理する長さではない）
-// dst_addr はコピーの方がよい。スレッド間では時間の流れが違うので別スレッドの dst_addr の値を保証できないから。
-// this（インスタンスのアドレスを指す）はプログラム終了まで同じはずなので（コピーとかしない限り）そのままでよい。
-std::unique_ptr<std::thread> MPUDPTunnelClient::_StartEchoThread(const std::string& dst_addr) {
-#define	perror_th(s)				perror("[ECHO_THREAD] " s)
-#define	print_error_th(format, ...)	print_error(("[ECHO_THREAD] " format), ## __VA_ARGS__)
-#define	pdebug_th(format, ...)		pdebug("[ECHO_THREAD] " format, ## __VA_ARGS__)
+bool MPUDPTunnelClient::_CheckEchoTimeout(std::vector<size_t>& timeout) {
+	const auto nw = system_clock::now();
+	bool fout = true;
 
-	return std::unique_ptr<std::thread>(new std::thread([dst_addr, this](){
-		using namespace std::chrono;
-
-		std::unique_ptr<ECHO_PACKET>	buf(new ECHO_PACKET);
-		std::vector<ECHO_SOCKETS>		echo_socks((std::size_t)this->socks.size());
-
-		ringbuf<decltype(buf->header.seq),32>	already_recvd_seq(-1);
-
-		addrinfo	*ai;
-		sockaddr_in	addr;
-		ssize_t		n;
-		int64_t		echo_seq = 0;
-		socklen_t	addr_len = sizeof(addr);
-
-		timeval	tv = { 0, 1000 };	// 最初は1ミリ秒後に強制的にタイムアウトさせてECHOを送る
-		fd_set	rfds;
-		int		max_fd = -1;
-		int		selret;
-
-		system_clock::time_point	now_time;
-
-		this->_GetAddressInfo(dst_addr, PORT_PING, &ai);
-
-		for (size_t i = 0; i < this->socks.size(); i++) {
-			// if false == 親スレッドに異常通知、終了
-			this->_SetupSocket(echo_socks[i].echo_sock, *ai, socks[i].eth_name);
-			echo_socks[i].device_id = socks[i].sock_fd;
-			max_fd = max(max_fd, echo_socks[i].echo_sock);
-			pdebug_th("echo_sockfd = %d, sock_fd = %d\n", echo_socks[i].echo_sock, socks[i].sock_fd);
-
-			echo_socks[i].recvd_count = 0;
-			echo_socks[i].rtt_avg = microseconds().min();
-			echo_socks[i].rtt_max = microseconds().min();
-			echo_socks[i].status.fill({ system_clock::now(), -1 });
+	std::for_each(this->echo_sent.begin(), this->echo_sent.end(),
+		[&](TIMEOUT& t) {
+			if (duration_cast<milliseconds>(nw - t.sent_time).count() >= PING_TIMEOUT_MSEC) {
+				fout = false;
+				timeout.emplace_back(t.device_id);
+				t = TIMEOUT_DEFAULT;
+			}
 		}
-		while (true) {
-			FD_ZERO(&rfds);
-			for (auto& e : echo_socks) { FD_SET(e.echo_sock, &rfds); }
+	);
+	return fout;
+}
 
-			selret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+bool MPUDPTunnelClient::_SendEchoPacket() {
+	std::vector<size_t>	down_device;
 
-			if (selret < 0) {
-				// 異常発生
-				if (errno == EINTR) continue;
+	ECHO_PACKET	*buf = (ECHO_PACKET*)GetHeader();
+	ssize_t		nwrite = 0;
 
-				perror_th("select : ");
-				exit(1);
-			}
-			if (selret == 0) {
-				// タイムアウト
-				for (auto& e : echo_socks) {
-					buf->header.device_id = e.device_id;
-					buf->header.seq = echo_seq;
-					buf->tm_start = system_clock::now();
+	buf->set_signature();
+	down_device.reserve(10);
 
-					n = sendto(e.echo_sock, buf.get(), sizeof(ECHO_PACKET), 0, ai->ai_addr, sizeof(*ai->ai_addr));
+	for (auto& s : this->socks) {
+		buf->seq = this->echo_seq;
+		buf->device_id = s.device_id;
+		buf->tm_start = system_clock::now();
+		nwrite = SendTo(s, sizeof(ECHO_PACKET) - sizeof(TUN_HEADER), TYPE_MANAGEMENT);
 
-					if (n < 0) {
-						perror_th("sendto : ");
-						// 回線落ち、パケットの振り替え処理へ
-						continue;
-					}
-					std::for_each(e.status.begin(), e.status.end(),
-						[&already_recvd_seq, &e](CONNECT_STATUS& s) {
-							// タイムアウトを 950ms に設定（selectが１秒でタイムアウトしたときに確実に真にするため）
-							// 送信したパケットのタイムアウトを監視
-							if (s.seq != -1 &&
-								duration_cast<milliseconds>(system_clock::now() - s.ping_sent_time).count() >= PING_TIMEOUT_MSEC) {
-								pdebug_th(
-									"ECHO PACKET TIMEOUT : sock_fd = %d, "
-									"device_id = %d, seq = %d\n",
-									e.echo_sock, e.device_id, s.seq
-								);
-								already_recvd_seq.push(s.seq);
-								s.ping_sent_time = system_clock::time_point().min();	// オーバーヘッドありそうなんだけど…
-								s.seq = -1;
-							}
-						}
-					);
-					e.status.push({ buf->tm_start, echo_seq });
-					echo_seq++;
-				}
-				now_time = system_clock::now();
-				tv.tv_sec  = 1;
-				tv.tv_usec = 0;
-				continue;
-			}
-			for (auto& e : echo_socks) {
-				if (FD_ISSET(e.echo_sock, &rfds)) {
-					n = recvfrom(
-						e.echo_sock, buf.get(), sizeof(ECHO_PACKET),
-						MSG_WAITALL, (sockaddr*)&addr, &addr_len
-					);
-					if (n < 0) {
-						perror_th("recvfrom : ");
-						// errno == CONNECTION_REFUSED ?
-						// 回線落ち、パケット振り替え処理へ
-						continue;
-					}
-					if (strncmp(buf->header.signature, SIGNATURE_MANAGEMENT, sizeof(buf->header.signature)) != 0) {
-						pdebug_th("signature is not valid\n");
-						continue;
-					}
-					if (strncmp(buf->signature, SIGNATURE_ECHO, sizeof(buf->signature)) != 0) {
-						STAT_PACKET	*stat = (STAT_PACKET*)buf.get();
-
-						if (strncmp(stat->signature, SIGNATURE_STAT, sizeof(stat->signature)) == 0) {
-							const auto ars_it = std::find(already_recvd_seq.begin(), already_recvd_seq.end(), stat->header.seq);
-							if (ars_it != already_recvd_seq.end()) {
-								pdebug_th(
-									"sock_fd = %d, device_id = %d, seq = %d, "
-									"packet is already received. skip.\n",
-									e.echo_sock, buf->header.device_id, buf->header.seq
-								);
-								continue;
-							}
-							already_recvd_seq.push(stat->header.seq);
-							pdebug_th(
-								"sock_fd = %d, device_id = %d, seq = %d\n"
-								"  speed = %d [B/s], loss_rate = %f%%\n",
-								e.echo_sock, stat->header.device_id, stat->header.seq,
-								stat->rcvd_bytes, (double)stat->loss_packets / stat->rcvd_packets
-							);
-						}
-						else {
-							pdebug_th("signature is not valid\n");
-						}
-						continue;
-					}
-					const auto ars_it = std::find(already_recvd_seq.begin(), already_recvd_seq.end(), buf->header.seq);
-					if (ars_it != already_recvd_seq.end()) {
-						pdebug_th(
-							"sock_fd = %d, device_id = %d, seq = %d, "
-							"packet is already received. skip.\n",
-							e.echo_sock, buf->header.device_id, buf->header.seq
-						);
-						continue;
-					}
-					// 行きと帰りではパケットの経路が異なる
-					// d is device
-					const auto d = std::find_if(echo_socks.begin(), echo_socks.end(),
-						[&buf](const ECHO_SOCKETS& e) { return e.device_id == buf->header.device_id; }
-					);
-					if (d == echo_socks.end()) { continue; }
-
-					auto diff_us = duration_cast<microseconds>(system_clock::now() - buf->tm_start);
-
-					d->rtt_max = max(d->rtt_max, diff_us);
-					d->rtt_avg = (d->rtt_avg * d->recvd_count + diff_us) / (d->recvd_count + 1);
-					d->score = diff_us.count() / (double)d->rtt_max.count();
-					d->recvd_count++;
-					already_recvd_seq.push(buf->header.seq);
-
-					const auto sts_it = std::find_if(d->status.begin(), d->status.end(),
-						[&buf](const CONNECT_STATUS& c) { return c.seq == buf->header.seq; }
-					);
-					if (sts_it != d->status.end()) {
-						sts_it->ping_sent_time = system_clock::now();
-						sts_it->seq = -1;
-					}
-					pdebug_th(
-						"ECHO PACKET RECVD: sock_fd = %d, device_id = %d, seq = %d, "
-						"RTT = %d.%dms, max = %d.%dms, avg = %d.%dms, score = %.3f\n",
-						e.echo_sock, buf->header.device_id, buf->header.seq,
-						  diff_us.count() / 1000,   diff_us.count() % 1000,
-						d->rtt_max.count() / 1000, d->rtt_max.count() % 1000,
-						d->rtt_avg.count() / 1000, d->rtt_avg.count() % 1000,
-						d->score
-					);
-				}
-			}
-			auto usec = duration_cast<microseconds>(system_clock::now() - now_time).count();
-			tv.tv_sec  = 0;
-			tv.tv_usec = (suseconds_t)(1 * 1000 * 1000 - usec);
+		if (nwrite < 0) {
+			throw std::runtime_error("sendto returned -1");
 		}
-		freeaddrinfo(ai);
-	}));
-#undef	perror_th
-#undef	print_error_th
-#undef	pdebug_th
+		if (!this->_CheckEchoTimeout(down_device)) {
+			std::for_each(down_device.begin(), down_device.end(),
+				[](size_t id){ pdebug("[!] ECHO TIMEOUT : device_id = %lx, device is DOWN?\n", id); }
+			);
+			//return false;
+		}
+		TIMEOUT	t = { buf->tm_start, this->echo_seq, s.device_id };
+		this->echo_sent.push(t);
+		this->echo_seq++;
+	}
+	return true;
+}
+
+bool MPUDPTunnelClient::_ProcessManagementPacket() {
+	char	*sign = (char*)this->GetDataPtr();
+
+	if (strncmp(sign, SIGNATURE_ECHO, strlen(SIGNATURE_ECHO)) == 0) {
+
+		// ECHO パケットを受信した
+
+		ECHO_PACKET		*buf = (ECHO_PACKET*)this->GetHeader();
+		microseconds	rtt;
+
+		// 受信したパケットの ECHO シーケンスを送信済みシーケンスリストと照合
+		// なお、ここではすでに TUN_HEADER レベルでシーケンスが同じものは排除済みであり、
+		// MODE_STABLE の重複の影響は受けず、ただ１つのパケットのみが受信される.
+		auto t = std::find_if(this->echo_sent.begin(), this->echo_sent.end(),
+			[buf](const TIMEOUT& t) { return t.seq == buf->seq; }
+		);
+		if (t == this->echo_sent.end()) {
+			pdebug("ECHO : t is END, seq = %d\n", buf->seq);
+			return false;
+		}
+
+		// 照合したシーケンス番号に紐付いたデバイスの検索
+		// 取得したデバイス情報を統計情報の更新のために用いる
+		auto s = std::find_if(this->stats.begin(), this->stats.end(),
+			[&t](const STATISTICS& st) { return st.device_id == t->device_id; }
+		);
+		if (s == this->stats.end()) {
+			pdebug("ECHO : s is END, device_id = %lx\n", t->device_id);
+			return false;
+		}
+		rtt = duration_cast<microseconds>(system_clock::now() - buf->tm_start);
+		s->rtt_max = max(s->rtt_max, rtt);
+		s->rtt_avg = (s->rtt_avg * s->recvd_count + rtt) / (s->recvd_count + 1);
+		s->score   = (double)rtt.count() / s->rtt_max.count();
+		s->recvd_count++;
+
+		pdebug(
+			"ECHO PACKET RECVD :\n"
+			"  device_id = %lx, seq = %d\n"
+			"  RTT = %d.%d[msec]\n"
+			"  RTTmax = %d.%d[msec]\n"
+			"  RTTavg = %d.%d[msec]\n"
+			"  score = %f\n",
+			s->device_id, buf->seq,
+			rtt.count() / 1000, rtt.count() % 1000,
+			s->rtt_max.count() / 1000, s->rtt_max.count() % 1000,
+			s->rtt_avg.count() / 1000, s->rtt_avg.count() % 1000,
+			s->score
+		);
+		*t = TIMEOUT_DEFAULT;
+		print_debug("ECHO %lx\n", buf->device_id);
+	}
+	else if (strncmp(sign, SIGNATURE_STAT, strlen(SIGNATURE_STAT)) == 0) {
+
+		// STAT パケットを受信した
+
+		STAT_PACKET	*buf = (STAT_PACKET*)this->GetHeader();
+
+		auto s = std::find_if(this->stats.begin(), this->stats.end(),
+			[buf](const STATISTICS& s) { return s.device_id == buf->device_id; }
+		);
+		if (s == this->stats.end()) {
+			pdebug("stats: s is END, device_id = %lx\n", buf->device_id);
+			return false;
+		}
+
+		s->rcvd_bytes   = buf->rcvd_bytes;
+		s->loss_packets = buf->loss_packets;
+		s->rcvd_packets = buf->rcvd_packets;
+
+		pdebug(
+			"STATS PACKET RECVD :\n"
+			"  device_id = %lx\n"
+			"  speed = %d[B/s]\n"
+			"  loss_rate = %f[%%]\n",
+			buf->device_id,
+			buf->rcvd_bytes,
+			(buf->rcvd_bytes == 0) ? 0 : (double)buf->loss_packets / buf->rcvd_packets
+		);
+		print_debug("STAT %lx\n", buf->device_id);
+	}
+	else {
+		pdebug("signature is not valid.\n");
+		return false;
+	}
+	for (const auto& s : this->stats) {
+		auto tm = system_clock::to_time_t(system_clock::now());
+
+		print_debug(
+			"[%d] ID=%lx, RTT(avg)=%d.%d[ms], SPD=%d[B/s], LPR=%f[%%]\n",
+			tm, s.device_id, s.rtt_avg / 1000, s.rtt_avg % 1000, s.rcvd_bytes,
+			(s.rcvd_packets == 0) ? 0 : s.loss_packets / (double)s.rcvd_packets
+		);
+	}
+	return true;
 }
 
 /*
@@ -299,13 +262,16 @@ std::unique_ptr<std::thread> MPUDPTunnelClient::_StartEchoThread(const std::stri
 bool MPUDPTunnelClient::MainLoop() {
 	fd_set	rfds;
 	int		max_fd = -1;
+	int		sel;
 
 	auto socks_it = socks.begin();
 	auto phead = this->GetHeader();
 	auto pdata = this->GetDataPtr();
 
 	uint32_t	nread, nwrite;
-	uint32_t	tun_seq = 0;
+	timeval		tv = { 0, 0 };	// 初期値、タイムアウト 10ms
+
+	system_clock::time_point	nw;
 
 	/*
 	 * 受信済みのパケット番号を記録する場所
@@ -313,11 +279,11 @@ bool MPUDPTunnelClient::MainLoop() {
 	 * 受信側で「すでに受信した」パケットは廃棄する必要がある。
 	 * このバッファは溢れた場合、古いものから自動的に削除される仕組み。
 	 */
-	ringbuf<decltype(GetHeader()->seq_all), 32>	seq_rec(-1);
+	ringbuf<decltype(GetHeader()->seq_all), 64>	seq_rec(-1);
 
 	std::for_each(
 		socks.begin(), socks.end(),
-		[&max_fd](const SOCKET_PACK& x){ max_fd = max(x.sock_fd, max_fd); }
+		[&max_fd](const SOCKET_PACK& s){ max_fd = max(s.sock_fd, max_fd); }
 	);
 	max_fd = max(this->sock_tun, max_fd);
 
@@ -329,81 +295,94 @@ bool MPUDPTunnelClient::MainLoop() {
 		for (const auto& s : this->socks) { FD_SET(s.sock_fd, &rfds); }
 
 		// データを受信するまで待機
-		if (select(max_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
+		sel = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+
+		if (sel < 0) {
 			if (errno == EINTR) continue;
 
 			perror("select()");
 			print_error("errno = %d\n", errno);
 			return false;
 		}
-		if (FD_ISSET(this->sock_tun, &rfds)) {
-			/* 
-			 * TUN デバイス側からデータを受信
-			 * ここに書き込まれるデータは生のIPパケット
-			 * ETH デバイスを選定してデータを書き込む（ネットワーク側に流す）
-			 */
-			try {
-				pdebug("\n===== TUN DEVICE RECEIVED DATA =====\n");
-				std::lock_guard<std::mutex>	lock(buf_mtx);	// try の間はバッファを占有
+		if (sel == 0) {
+			// タイムアウト
+			// ECHOを送る時間
+			this->_SendEchoPacket();
 
-				// this->data_buf にデータを書き込んでおくと勝手に運んでくれる
-				nread = tun_eread(sock_tun, pdata, BUFSIZE);
-				pdebug_tunrecv(tun_seq, nread, pdata);
-				tun_seq++;
-
-				// ラウンドロビンでデータを送る
-				// ここにパケットを効率よく分散する機構を組み込む
-				nwrite = this->SendTo(*socks_it, nread);
-				pdebug("packet was sent to eth device = %s: %lu bytes\n", socks_it->eth_name.c_str(), nwrite);
-
-				socks_it++;
-				if (socks_it == socks.cend()) { socks_it = socks.begin(); }
-			} catch (std::exception& e) {
-				perror("eread / sendto");
-				print_error("errno = %d\n", errno);
-				print_error("%s - the data will be discarded. Continue.\n", e.what());
-			}
+			tv.tv_sec  = 1;
+			tv.tv_usec = 0;
+			nw = system_clock::now();
+			continue;
 		}
-		for (auto& s : this->socks) {
-			if (FD_ISSET(s.sock_fd, &rfds)) {
+		else {
+			// 何らかのデバイスからパケットを受信
+			if (FD_ISSET(this->sock_tun, &rfds)) {
 				/* 
-				 * ETH デバイス側からデータを受信
-				 * パケットサイズがMTUを超える場合、パケットは複数に分割される
-				 * この分割、また受信時の再合成の処理はより低いレイヤー（ネットワーク層）で行われるので、
-				 * UDPのレイヤでは特に考えなくて良い。ただし、パケットが遅れて到着する可能性はあるので、
-				 * 送信したバイト数を読み切るまで待機する処理が必要（ここでは readn が行う）
-				 */
+				* TUN デバイス側からデータを受信
+				* ここに書き込まれるデータは生のIPパケット
+				* ETH デバイスを選定してデータを書き込む（ネットワーク側に流す）
+				*/
 				try {
-					pdebug("\n===== ETH DEVICE [%s] RECEIVED DATA =====\n", s.eth_name.c_str());
-					std::lock_guard<std::mutex>	lock(buf_mtx);	// try の間はバッファを占有
-					sockaddr_in	addr_from;
+					pdebug("\n===== TUN DEVICE RECEIVED DATA =====\n");
+					// this->data_buf にデータを書き込んでおくと勝手に運んでくれる
+					nread = tun_eread(sock_tun, pdata, BUFSIZE);
+					pdebug_tunrecv(nread, pdata);
 
-					nread = this->RecvFrom(s, &addr_from);
+					// ラウンドロビンでデータを送る
+					// ここにパケットを効率よく分散する機構を組み込む
+					nwrite = this->SendTo(*socks_it, nread);
+					pdebug("packet was sent to eth device = %s: %lu bytes\n", socks_it->eth_name.c_str(), nwrite);
 
-					pdebug_ethrecv(phead->seq_all, nread, (uint8_t*)phead, addr_from);
-
-					if (phead->mode == MODE_STABLE) {
-						const auto it = std::find(seq_rec.begin(), seq_rec.end(), phead->seq_all);
-
-						pdebug("seq = %d\n", phead->seq_all);
-
-						if (it != seq_rec.end()) {
-							pdebug("packet was already received: skip.\n");
-							continue;
-						}
-						seq_rec.push(phead->seq_all);
-					}
-					nwrite = tun_ewrite(sock_tun, pdata, phead->length);
-					pdebug("packet was sent to tun seq=%d : write %lu bytes\n", phead->seq_all, nwrite);
-				}
-				catch (std::exception &e) {
-					perror("recvfrom / ewrite");
-					pdebug("errno = %d\n", errno);
+					socks_it++;
+					if (socks_it == socks.cend()) { socks_it = socks.begin(); }
+				} catch (std::exception& e) {
+					perror("eread / sendto");
+					print_error("errno = %d\n", errno);
 					print_error("%s - the data will be discarded. Continue.\n", e.what());
 				}
 			}
+			for (auto& s : this->socks) {
+				if (FD_ISSET(s.sock_fd, &rfds)) {
+					/* 
+					* ETH デバイス側からデータを受信
+					* パケットサイズがMTUを超える場合、パケットは複数に分割される
+					* この分割、また受信時の再合成の処理はより低いレイヤー（ネットワーク層）で行われるので、
+					* UDPのレイヤでは特に考えなくて良い。ただし、パケットが遅れて到着する可能性はあるので、
+					* 送信したバイト数を読み切るまで待機する処理が必要（ここでは readn が行う）
+					*/
+					try {
+						pdebug("\n===== ETH DEVICE [%s] RECEIVED DATA =====\n", s.eth_name.c_str());
+						sockaddr_in	addr_from;
+
+						nread = this->RecvFrom(s, &addr_from);
+
+						pdebug_ethrecv(phead->seq_all, nread, (uint8_t*)phead, addr_from);
+
+						if (phead->mode == MODE_STABLE) {
+							const auto it = std::find(seq_rec.begin(), seq_rec.end(), phead->seq_all);
+							if (it != seq_rec.end()) {
+								pdebug("packet was already received: skip.\n");
+								continue;
+							}
+							seq_rec.push(phead->seq_all);
+
+							if (phead->type == TYPE_MANAGEMENT) {
+								this->_ProcessManagementPacket();
+								continue;
+							}
+						}
+						nwrite = tun_ewrite(sock_tun, pdata, phead->length);
+						pdebug("packet was sent to tun seq=%d : write %lx bytes\n", phead->seq_all, nwrite);
+					}
+					catch (std::exception &e) {
+						perror("recvfrom / ewrite");
+						pdebug("errno = %d\n", errno);
+						print_error("%s - the data will be discarded. Continue.\n", e.what());
+					}
+				}
+			}
+			settimer_1sec(tv, nw);
 		}
 	}
-	this->th_echo->join();
 	return true;
 }

@@ -5,7 +5,8 @@ OBJS	= main.o network.o print.o client.o server.o mpudp.o
 INCS	= network.h server.h print.h ringbuf.h mpudp.h mpudpdef.h
 
 $(TARGET): $(OBJS) Makefile
-	$(CC) $(OBJS) -g -pthread -o $@
+	$(CC) $(OBJS) -g -o $@
+#	$(CC) $(OBJS) -g -pthread -o $@
 
 %.o: %.cpp $(INCS) Makefile
 	$(CC) $(CPPFLAGS) -c -o $@ $<

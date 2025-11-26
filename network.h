@@ -27,69 +27,93 @@ typedef enum _TRANSMIT_MODE {
 	MODE_STABLE
 } TRANSMIT_MODE;
 
-// パケット転送に関わる情報（16バイト）
-// 転送される各パケットの前に付加される
-typedef struct {
-	uint8_t		mode;		// TRANSMIT_MODE を参照
-	uint8_t		device_id;	// Ethernetデバイスに振られるID（実際にはソケットのFD）
-	uint16_t	length;		// データペイロード長
-	uint32_t	seq_all;	// 全体シーケンス：同じ番号は同じパケットであることを示す
+typedef enum _PACKET_TYPE {
+	TYPE_GENERAL,
+	TYPE_MANAGEMENT
+} PACKET_TYPE;
 
+//  0 |-m-|-t-|--- len ---|---- reserved ----|
+//  8 |------------- device_id --------------|
+// 16 |----- seq_all -----|---- seq_dev -----|
+
+// パケット転送に関わる情報（24バイト）
+// 転送される各パケットの前に付加される
+typedef struct _TUN_HEADER {
+	uint8_t		mode;		// TRANSMIT_MODE を参照
+	uint8_t		type;		// PACKET_TYPE を参照
+	uint16_t	length;		// データペイロード長
+	uint8_t		reserved[4];
+
+	size_t		device_id;	// Ethernetデバイスに振られるID (64bits)
+
+	uint32_t	seq_all;	// 全体シーケンス：同じ番号は同じパケットであることを示す
 	uint32_t	seq_dev;	// デバイスシーケンス：同じデバイス上でパケットの連続性を示す
-	uint32_t	reserved;
 } TUN_HEADER;
 
 
-#define		SIGNATURE_MANAGEMENT	"Mnge"
+// TUN_HEADER は本プログラムのIPレイヤのように動作させる
+// ECHO や STAT からは TUN_HEADER を参照しなくてもよいように作れ
 
-// 16バイト
-typedef struct _MANAGEMENT_PACKET {
-	int64_t	seq;
-	int32_t	device_id;
-	char	signature[4];	// length of SIGNATURE_MANAGEMENT
-
-	_MANAGEMENT_PACKET() {
-		for (size_t i = 0; i < strlen(SIGNATURE_MANAGEMENT); i++) {
-			signature[i] = SIGNATURE_MANAGEMENT[i];
-		}
-	}
-} MANAGEMENT_PAKCET;
-
+//  0 |------------- TUN_HEADER -------------|
+// 24 |---- signature ----|------ seq -------|
+// 32 |------------- device_id --------------|
+// 40 |------------ time_point --------------|
 
 #define	SIGNATURE_ECHO	"Echo"
 
+// 24 + 24 バイト
 typedef struct _ECHO_PACKET {
-	MANAGEMENT_PAKCET	header;
-	std::chrono::system_clock::time_point	tm_start;
-	uint8_t		rsvd[4];
-	char		signature[4];
+	TUN_HEADER	header;
 
-	_ECHO_PACKET() {
+	char		signature[4];	// かならず TUN_HEADER の直後に配置
+	int32_t		seq;
+
+	size_t		device_id;	// このECHOパケットがどのデバイスのものとして送信されたか
+
+	std::chrono::system_clock::time_point	tm_start;
+
+	_ECHO_PACKET() { set_signature(); }
+
+	inline void set_signature() {
 		for (size_t i = 0; i < strlen(SIGNATURE_ECHO); i++) { signature[i] = SIGNATURE_ECHO[i];	}
 	}
 } ECHO_PACKET;
 
+
+//  0 |------------- TUN_HEADER -------------|
+// 24 |---- signature ----|--- rcvd_bytes ---|
+// 32 |-- loss_packets ---|-- rcvd_packets --|
+// 40 |------------- device_id --------------|
+
 #define	SIGNATURE_STAT	"Stat"
 
+// 24 + 24 バイト
+// サーバーからクライアントに送る回線の統計情報
 typedef struct _STAT_PACKET {
-	MANAGEMENT_PAKCET	header;
+	TUN_HEADER	header;
+
+	char		signature[4];	// かならず TUN_HEADER の直後に配置
 	int32_t		rcvd_bytes;
+
 	uint		loss_packets;
 	uint		rcvd_packets;
-	char	signature[4];
 
-	_STAT_PACKET() {
+	size_t		device_id;		// この STAT パケットがどのデバイスのものとして送信されたか
+
+	_STAT_PACKET() { set_signature(); }
+
+	inline void set_signature() {
 		for (size_t i = 0; i < strlen(SIGNATURE_STAT); i++) { signature[i] = SIGNATURE_STAT[i];	}
 	}
 } STAT_PACKET;
 
 typedef struct _SOCKET_PACK {
-	int			sock_fd;		// == device_id
+	int			sock_fd;
 	sockaddr_in	remote_addr;
 	sockaddr_in	local_addr;
 	std::string	eth_name;
 	uint32_t	seq_dev;
-	uint32_t	device_id;
+	size_t		device_id;
 
 	explicit _SOCKET_PACK() : sock_fd(-1), seq_dev(0) {}
 	~_SOCKET_PACK() {
@@ -107,6 +131,7 @@ typedef struct _SOCKET_PACK {
 		eth_name	= old.eth_name;
 		sock_fd		= old.sock_fd;
 		seq_dev		= old.seq_dev;
+		device_id	= old.device_id;
 		old.sock_fd = -1;
 	}
 

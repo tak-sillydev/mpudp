@@ -21,9 +21,9 @@ void print_debug(const char *format, ...) {
 	return;
 }
 
-void pdebug_tunrecv(const int seq, const int nread, const uint8_t* buf) {
-	pdebug("from tun seq=%d : read %lu bytes\n", seq, nread);
-	pdebug("IP header says: packet length = %lu\n", ntohs(((unsigned short*)buf)[1]));
+void pdebug_tunrecv(int nread, const uint8_t* buf) {
+	pdebug("from tun: read %lu bytes\n", nread);
+	pdebug("LENGTH of packet [IP header]: %lu bytes\n", ntohs(((unsigned short*)buf)[1]));
 	pdebug("Head 8 bytes of buffer = %02X %02X %02X %02X %02X %02X %02X %02X\n",
 		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
 	);
@@ -48,7 +48,7 @@ void pdebug_ethrecv(const int seq, const int nread, const uint8_t* buf, sockaddr
 	pdebug(
 		"TUN_HEADER info:\n"
 		"  mode = %s\n"
-		"  device_id = %d\n"
+		"  device_id = %lx\n"
 		"  length = %d\n"
 		"  seq_all = %d\n"
 		"  seq_dev = %d\n",

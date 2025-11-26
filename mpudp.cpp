@@ -1,15 +1,11 @@
 #include "mpudp.h"
 
-MPUDPTunnel::MPUDPTunnel(uint32_t szbuf) :
-	seq(0), tun_buf(new uint8_t[szbuf + sizeof(TUN_HEADER)]), sock_tun(-1) {
-	//this->socks.reserve(10);
+MPUDPTunnel::MPUDPTunnel(uint32_t szbuf) : seq(0), sock_tun(-1) {
+	this->tun_buf.reset(new uint8_t[szbuf + sizeof(TUN_HEADER)]);
 	this->data_buf = this->tun_buf.get() + sizeof(TUN_HEADER);
 }
 
 MPUDPTunnel::~MPUDPTunnel() {
-	if (th_echo->joinable()) {
-		th_echo->join();
-	}
 	if (sock_tun != -1) {
 		close(sock_tun);
 	}
@@ -39,8 +35,8 @@ ssize_t MPUDPTunnel::_sendto(SOCKET_PACK& s, uint16_t data_len) {
 			inet_ntoa(s.remote_addr.sin_addr), ntohs(s.remote_addr.sin_port)
 		);
 		s.seq_dev++;
-		
-	} catch(std::exception& e) {
+	}
+	catch(std::exception& e) {
 		perror("sendto");
 		print_error("%s : %d\n", e.what(), errno);
 		nwrite = -1;
@@ -49,36 +45,46 @@ ssize_t MPUDPTunnel::_sendto(SOCKET_PACK& s, uint16_t data_len) {
 }
 
 // data_len はペイロード長
-ssize_t MPUDPTunnel::SendTo(SOCKET_PACK& s, uint16_t data_len) {
+ssize_t MPUDPTunnel::SendTo(SOCKET_PACK& s, uint16_t data_len, uint8_t type) {
 	TUN_HEADER	*phead = (TUN_HEADER*)tun_buf.get();
 	ssize_t		nwrite = 0;
 
-	phead->device_id = s.sock_fd;
+	phead->device_id = s.device_id;
 	phead->length = data_len;
 	phead->seq_all = this->seq;
 	phead->seq_dev = s.seq_dev;
 	phead->mode = MODE_SPEED;
+	phead->type = type;
 
 	nwrite = this->_sendto(s, data_len);
-	this->seq++;
+	
+	if (nwrite > 0) {
+		this->seq++;
+	}
 	return nwrite;
 }
 
-ssize_t MPUDPTunnel::SendToAllDevices(uint16_t data_len) {
+// MODE_STABLE（冗長化）のために各デバイスに一斉送信
+ssize_t MPUDPTunnel::SendToAllDevices(uint16_t data_len, uint8_t type) {
 	TUN_HEADER	*phead = (TUN_HEADER*)tun_buf.get();
 	ssize_t		nwrite = 0;
+	ssize_t		all_write = -1;	// 少なくともどれかのデバイスでパケットが送られれば 0 以上
 
 	phead->length = data_len;
 	phead->seq_all = this->seq;
 	phead->mode = MODE_STABLE;
+	phead->type = type;
 
 	if (socks.size() == 0) { return 0; }
 
 	for (auto& s : socks) {
-		phead->device_id = s.sock_fd;
+		phead->device_id = s.device_id;	// ソケットに対応付けられたデバイスID
+		phead->seq_dev = s.seq_dev;		// デバイス（サーバーモードの場合はソケット）ごとのパケットシーケンス
 		nwrite = this->_sendto(s, data_len);
+
+		all_write = max(all_write, nwrite);
 	}
-	this->seq++;
+	if (all_write > 0) { this->seq++; }
 	return nwrite;
 }
 
