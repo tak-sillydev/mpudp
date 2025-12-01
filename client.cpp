@@ -1,5 +1,5 @@
 #include <algorithm>
-#include <iomanip>
+#include <random>
 
 #include <sys/types.h>
 #include <netdb.h>
@@ -8,6 +8,41 @@
 #include "print.h"
 #include "mpudp.h"
 
+constexpr int _balance = BALANCE_ROUNDROBIN;
+
+double _STATISTICS::CalculateScore(chr::microseconds rtt_worst) {
+	double	ping_score, lpr_score;
+	double	lpr_target = 0.01f;		// パケロス率 1%を目標に設定、現状とのズレが大きいほどスコアを小さく
+
+	// ping_score : UDPing 値が小さいほどスコアが高い
+	// microseconds 同士で割り算すると結果が int64_t になって正規化に失敗する
+	// rtt_avg（平均値）でやる意味はあるのだろうか
+	ping_score = (double)this->rtt_avg.count() / rtt_worst.count();	// 0-1の範囲で RTT を正規化（1に近づくほど悪い）
+	ping_score = abs(ping_score - 1);								// -1 を最良値、0 を最悪値にして絶対値化
+
+	//lpr_score = 1 - this->loss_rate();
+	lpr_score = lpr_target - this->loss_rate();
+
+	this->score += (0.1 * ping_score + lpr_score) * this->score;
+
+	if (this->score > 1) { this->score = 1.0f; }
+	print_debug("SCORE : id=%lx, ps=%f, ls=%f, ttl=%f\n", this->device_id, ping_score, lpr_score, this->score);
+
+	return this->score;
+}
+
+int MPUDPTunnelClient::_SelectDeviceDynamic() {
+	static std::random_device	rd;
+	static std::mt19937			sel(rd());
+	static std::vector<double>	prob(this->stats.size());
+
+	// 現状 AddDevice() で socks と stats は同時に要素の追加を行っているので
+	// ソートについては気にする必要がない…が
+	for (size_t i = 0; i < stats.size(); i++) { prob[i] = stats[i].score; }
+	std::discrete_distribution<>	dist(prob.begin(), prob.end());
+
+	return dist(sel);
+}
 
 bool MPUDPTunnelClient::_GetAddressInfo(const std::string& dst_addr, const int dst_port, addrinfo **result) {
 	char		port_str[16];
@@ -111,12 +146,12 @@ void MPUDPTunnelClient::AddDevice(const std::string& device_name) {
 }
 
 bool MPUDPTunnelClient::_CheckEchoTimeout(std::vector<size_t>& timeout) {
-	const auto nw = system_clock::now();
+	const auto nw = chr::system_clock::now();
 	bool fout = true;
 
 	std::for_each(this->echo_sent.begin(), this->echo_sent.end(),
 		[&](TIMEOUT& t) {
-			if (duration_cast<milliseconds>(nw - t.sent_time).count() >= PING_TIMEOUT_MSEC) {
+			if (chr::duration_cast<chr::milliseconds>(nw - t.sent_time).count() >= PING_TIMEOUT_MSEC) {
 				fout = false;
 				timeout.emplace_back(t.device_id);
 				t = TIMEOUT_DEFAULT;
@@ -138,7 +173,7 @@ bool MPUDPTunnelClient::_SendEchoPacket() {
 	for (auto& s : this->socks) {
 		buf->seq = this->echo_seq;
 		buf->device_id = s.device_id;
-		buf->tm_start = system_clock::now();
+		buf->tm_start = chr::system_clock::now();
 		nwrite = SendTo(s, sizeof(ECHO_PACKET) - sizeof(TUN_HEADER), TYPE_MANAGEMENT);
 
 		if (nwrite < 0) {
@@ -165,7 +200,8 @@ bool MPUDPTunnelClient::_ProcessManagementPacket() {
 		// ECHO パケットを受信した
 
 		ECHO_PACKET		*buf = (ECHO_PACKET*)this->GetHeader();
-		microseconds	rtt;
+		chr::microseconds	rtt;
+		chr::microseconds	rtt_worst = chr::microseconds::min();
 
 		// 受信したパケットの ECHO シーケンスを送信済みシーケンスリストと照合
 		// なお、ここではすでに TUN_HEADER レベルでシーケンスが同じものは排除済みであり、
@@ -187,11 +223,16 @@ bool MPUDPTunnelClient::_ProcessManagementPacket() {
 			pdebug("ECHO : s is END, device_id = %lx\n", t->device_id);
 			return false;
 		}
-		rtt = duration_cast<microseconds>(system_clock::now() - buf->tm_start);
+		rtt = chr::duration_cast<chr::microseconds>(chr::system_clock::now() - buf->tm_start);
 		s->rtt_max = max(s->rtt_max, rtt);
 		s->rtt_avg = (s->rtt_avg * s->recvd_count + rtt) / (s->recvd_count + 1);
-		s->score   = (double)rtt.count() / s->rtt_max.count();
 		s->recvd_count++;
+
+		// 全回線の UDPing 最大値（最も遅い）を取得
+		std::for_each(stats.begin(), stats.end(),
+			[&rtt_worst](const STATISTICS& st) { rtt_worst = max(rtt_worst, st.rtt_max); }
+		);
+		s->CalculateScore(rtt_worst);
 
 		pdebug(
 			"ECHO PACKET RECVD :\n"
@@ -214,6 +255,7 @@ bool MPUDPTunnelClient::_ProcessManagementPacket() {
 		// STAT パケットを受信した
 
 		STAT_PACKET	*buf = (STAT_PACKET*)this->GetHeader();
+		chr::microseconds	rtt_worst = chr::microseconds::min();
 
 		auto s = std::find_if(this->stats.begin(), this->stats.end(),
 			[buf](const STATISTICS& s) { return s.device_id == buf->device_id; }
@@ -227,6 +269,12 @@ bool MPUDPTunnelClient::_ProcessManagementPacket() {
 		s->loss_packets = buf->loss_packets;
 		s->rcvd_packets = buf->rcvd_packets;
 
+		// 全回線の UDPing 最大値（最も遅い）を取得
+		std::for_each(stats.begin(), stats.end(),
+			[&rtt_worst](const STATISTICS& st) { rtt_worst = max(rtt_worst, st.rtt_max); }
+		);
+		s->CalculateScore(rtt_worst);
+
 		pdebug(
 			"STATS PACKET RECVD :\n"
 			"  device_id = %lx\n"
@@ -234,7 +282,7 @@ bool MPUDPTunnelClient::_ProcessManagementPacket() {
 			"  loss_rate = %f[%%]\n",
 			buf->device_id,
 			buf->rcvd_bytes,
-			(buf->rcvd_bytes == 0) ? 0 : (double)buf->loss_packets / buf->rcvd_packets
+			(buf->rcvd_bytes == 0) ? 0 : (double)buf->loss_packets / (buf->rcvd_packets + buf->loss_packets) * 100
 		);
 		print_debug("STAT %lx\n", buf->device_id);
 	}
@@ -243,12 +291,12 @@ bool MPUDPTunnelClient::_ProcessManagementPacket() {
 		return false;
 	}
 	for (const auto& s : this->stats) {
-		auto tm = system_clock::to_time_t(system_clock::now());
+		auto tm = chr::system_clock::to_time_t(chr::system_clock::now());
 
 		print_debug(
-			"[%d] ID=%lx, RTT(avg)=%d.%d[ms], SPD=%d[B/s], LPR=%f[%%]\n",
+			"[%d] ID=%lx, RTT(avg)=%d.%d[ms], SPD=%d[B/s], LPR=%f[%%], score=%f\n",
 			tm, s.device_id, s.rtt_avg / 1000, s.rtt_avg % 1000, s.rcvd_bytes,
-			(s.rcvd_packets == 0) ? 0 : s.loss_packets / (double)s.rcvd_packets
+			s.loss_rate() * 100, s.score
 		);
 	}
 	return true;
@@ -271,7 +319,11 @@ bool MPUDPTunnelClient::MainLoop() {
 	uint32_t	nread, nwrite;
 	timeval		tv = { 0, 0 };	// 初期値、タイムアウト 10ms
 
-	system_clock::time_point	nw;
+	chr::system_clock::time_point	nw;
+
+	std::vector<int>	selected_devices;
+
+	selected_devices.resize(socks.size(), 0);
 
 	/*
 	 * 受信済みのパケット番号を記録する場所
@@ -311,7 +363,7 @@ bool MPUDPTunnelClient::MainLoop() {
 
 			tv.tv_sec  = 1;
 			tv.tv_usec = 0;
-			nw = system_clock::now();
+			nw = chr::system_clock::now();
 			continue;
 		}
 		else {
@@ -328,13 +380,24 @@ bool MPUDPTunnelClient::MainLoop() {
 					nread = tun_eread(sock_tun, pdata, BUFSIZE);
 					pdebug_tunrecv(nread, pdata);
 
-					// ラウンドロビンでデータを送る
-					// ここにパケットを効率よく分散する機構を組み込む
-					nwrite = this->SendTo(*socks_it, nread);
-					pdebug("packet was sent to eth device = %s: %lu bytes\n", socks_it->eth_name.c_str(), nwrite);
+					if (_balance == BALANCE_ROUNDROBIN) {
+						// ラウンドロビンでデータを送る
+						// ここにパケットを効率よく分散する機構を組み込む
+						nwrite = this->SendTo(*socks_it, nread);
+						pdebug("packet was sent to eth device = %s: %lu bytes\n", socks_it->eth_name.c_str(), nwrite);
 
-					socks_it++;
-					if (socks_it == socks.cend()) { socks_it = socks.begin(); }
+						socks_it++;
+						if (socks_it == socks.cend()) { socks_it = socks.begin(); }
+					}
+					else if (_balance == BALANCE_DYNAMICSEL) {
+						// ダイナミック・ロードバランシング
+						// 回線スコアを見て、負荷の少なそうなところにパケットを動的に割り振る
+						int index = this->_SelectDeviceDynamic();
+
+						nwrite = this->SendTo(socks[index], nread);
+						selected_devices[index]++;
+						pdebug("packet was sent to eth device = %s: %lu bytes\n", socks[index].eth_name.c_str(), nwrite);
+					}
 				} catch (std::exception& e) {
 					perror("eread / sendto");
 					print_error("errno = %d\n", errno);

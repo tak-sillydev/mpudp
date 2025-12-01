@@ -21,6 +21,7 @@
 #include <chrono>
 
 #define	max(a, b)	(((a) > (b)) ? (a) : (b))
+#define	abs(n)		(((n) < 0) ? -(n) : (n))
 
 typedef enum _TRANSMIT_MODE {
 	MODE_SPEED,

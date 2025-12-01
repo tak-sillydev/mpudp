@@ -16,7 +16,7 @@
 #include "network.h"
 #include "ringbuf.h"
 
-using namespace std::chrono;
+namespace chr = std::chrono;
 
 //////////////////////////===============================//////////////////////////
 //////////////////////////  MPUDP-Tunnel Base Structures //////////////////////////
@@ -35,9 +35,9 @@ protected:
 	std::vector<SOCKET_PACK>	socks;
 	int			sock_tun;
 
-	inline void settimer_1sec(timeval& tv, system_clock::time_point base) {
+	inline void settimer_1sec(timeval& tv, chr::system_clock::time_point base) {
 		tv.tv_sec  = 0;
-		tv.tv_usec = (1 * 1000 * 1000) - duration_cast<microseconds>(system_clock::now() - base).count();
+		tv.tv_usec = (1 * 1000 * 1000) - chr::duration_cast<chr::microseconds>(chr::system_clock::now() - base).count();
 
 		if (tv.tv_usec < 0) tv.tv_usec = 0;
 		return;
@@ -71,7 +71,7 @@ public:
 
 // 接続元・統計情報
 typedef struct _CONNECTIONS {
-	system_clock::time_point	connected_time;
+	chr::system_clock::time_point	connected_time;
 	sockaddr_in	addr;
 	size_t		device_id;
 	int32_t		rcvd_bytes;
@@ -81,7 +81,7 @@ typedef struct _CONNECTIONS {
 	ringbuf<int32_t, 256>	loss_buf;
 
 	_CONNECTIONS() :
-		connected_time(system_clock::time_point::min()), rcvd_bytes(0),
+		connected_time(chr::system_clock::time_point::min()), rcvd_bytes(0),
 		last_seq(0), loss_packets(0), rcvd_packets(0), loss_buf(-1) {}
 
 	void reset_stats() {
@@ -121,7 +121,7 @@ public:
 //////////////////////////  MPUDP-Tunnel Client Structures //////////////////////////
 //////////////////////////=================================//////////////////////////
 
-#define	TIMEOUT_DEFAULT	{ system_clock::time_point::min(), -1, 0 }
+#define	TIMEOUT_DEFAULT	{ chr::system_clock::time_point::min(), -1, 0 }
 
 // クライアントがECHOパケットを送信した時刻を記録保存する
 //  サーバからECHOが返って来たとき、seq と device_id で送ったパケットを照合し、
@@ -129,7 +129,7 @@ public:
 //  サーバは冗長化のため、受け取ったECHOパケットに対する返信を既知の経路全てに対して行う。
 //  行き帰りで経路（デバイス）が異なる場合があるため「どのデバイスから送られたか（= device_id）」の情報が必要。
 typedef struct _TIMEOUT {
-	system_clock::time_point	sent_time;
+	chr::system_clock::time_point	sent_time;
 	int32_t		seq;
 	size_t		device_id;
 
@@ -146,6 +146,7 @@ typedef struct _STATISTICS {
 	uint64_t	recvd_count;
 	std::chrono::microseconds	rtt_max;
 	std::chrono::microseconds	rtt_avg;
+	//std::chrono::microseconds	rtt_latest;
 
 	// STATS 関連
 	int32_t		rcvd_bytes;
@@ -153,27 +154,34 @@ typedef struct _STATISTICS {
 	uint		rcvd_packets;
 
 	_STATISTICS() :
-		device_id(0), score(0), recvd_count(0),
+		device_id(0), score(1), recvd_count(0),
 		rtt_max(std::chrono::microseconds::min()),
 		rtt_avg(std::chrono::microseconds::min()),
 		rcvd_bytes(0), loss_packets(0), rcvd_packets(0) {}
+	
+	double loss_rate() const {
+		return (rcvd_packets == 0) ? 0 : (double)loss_packets / (loss_packets + rcvd_packets);
+	}
+	double CalculateScore(chr::microseconds rtt_worst);
 } STATISTICS;
 
 class MPUDPTunnelClient : public MPUDPTunnel {
 private:
 	std::vector<STATISTICS>	stats;
 	ringbuf<TIMEOUT, 64>	echo_sent;
-	int32_t		echo_seq;
+	int32_t			echo_seq;
 
 	bool _GetAddressInfo(const std::string& dst_addr, const int dst_port, addrinfo **result);
 	bool _SetupSocket(int& sock_fd, const addrinfo& ai, const std::string& eth_name);
 	bool _CheckEchoTimeout(std::vector<size_t>& timeout);
 	bool _SendEchoPacket();
 	bool _ProcessManagementPacket() override;
+	int  _SelectDeviceDynamic();
 
 	bool Start(const std::string& tun_name, const std::string& addr, const int port);
 
 public:
+	// dev_selector は必ずメンバイニシャライザで初期化（operator() と混同されてエラーになる）
 	explicit MPUDPTunnelClient(uint32_t szbuf) : MPUDPTunnel(szbuf), echo_seq(0) {
 		this->echo_sent.fill(TIMEOUT_DEFAULT);
 	};

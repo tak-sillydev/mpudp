@@ -79,8 +79,6 @@ ssize_t MPUDPTunnelServer::RecvFrom(sockaddr_in *addr_from) {
 // 今までにない経路からの通信なら返信リストに登録
 // デバイスIDが同じでも、ポート番号などアドレス情報が変わっていれば更新
 void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from, int nrecv) {
-	using namespace std::chrono;
-
 	TUN_HEADER	*phead = this->GetHeader();
 
 	// 接続リストに今回の接続のデバイスIDで検索をかける
@@ -100,7 +98,7 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from, int nrecv) {
 
 		c.addr = addr_from;
 		c.device_id = phead->device_id;
-		c.connected_time = system_clock::now();
+		c.connected_time = chr::system_clock::now();
 
 		this->conn_list.emplace_back(c);	// 末尾に追加して
 		conn_it = --conn_list.end();		// そのイテレータを取る
@@ -122,7 +120,7 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from, int nrecv) {
 			}
 		}
 		// 接続時間の更新
-		conn_it->connected_time = system_clock::now();
+		conn_it->connected_time = chr::system_clock::now();
 	}
 
 	// 回線速度とパケットロス率の測定
@@ -135,8 +133,12 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from, int nrecv) {
 	else if (phead->seq_dev < conn_it->last_seq) {
 		// 順序交代したパケットが届いた
 		auto q = std::find(conn_it->loss_buf.begin(), conn_it->loss_buf.end(), phead->seq_dev);
-		*q = -1;	// ロスパケリストから削除
-		conn_it->loss_packets--;
+
+		// reset_stat 直後（もうロスしたものとして計上してしまった）に順序交代したパケットが届くと困る
+		if (q != conn_it->loss_buf.end()) {
+			*q = -1;	// ロスパケリストから削除
+			conn_it->loss_packets--;
+		}
 	}
 	conn_it->last_seq = max(conn_it->last_seq, phead->seq_dev);
 	conn_it->rcvd_bytes += nrecv;
@@ -145,16 +147,17 @@ void MPUDPTunnelServer::_RefreshConnection(sockaddr_in& addr_from, int nrecv) {
 	pdebug(
 		"speed: %dB, rcvd = %d, loss = %d, loss.rate = %f\n",
 		conn_it->rcvd_bytes, conn_it->rcvd_packets,
-		conn_it->loss_packets, (double)conn_it->loss_packets / conn_it->rcvd_packets
+		conn_it->loss_packets,
+		(double)conn_it->loss_packets / (conn_it->rcvd_packets + conn_it->loss_packets)
 	);
 	// 最後に「１分以上データの飛んでこない接続元」を閉じる
 	// socksをリストにした方が良いかも
 
 	// 削除対象のコネクションを探す
-	auto now = system_clock::now();
+	auto now = chr::system_clock::now();
 	auto conn_end = std::remove_if(conn_list.begin(), conn_list.end(),
 		[now](const CONNECTIONS& c) {
-			return duration_cast<minutes>(now - c.connected_time).count() >= 1;
+			return chr::duration_cast<chr::minutes>(now - c.connected_time).count() >= 1;
 		}
 	);
 	if (conn_end == conn_list.end()) return;	// 削除すべきものはない
@@ -236,7 +239,7 @@ bool MPUDPTunnelServer::MainLoop() {
 	auto	phead = this->GetHeader();
 	auto	pdata = this->GetDataPtr();
 
-	system_clock::time_point	nw;
+	chr::system_clock::time_point	nw;
 	timeval	tv = { 0, 1 * 1000 * 100 };
 
 	max_fd = max(sock_tun, sock_recv);
@@ -262,7 +265,7 @@ bool MPUDPTunnelServer::MainLoop() {
 
 			tv.tv_sec  = 1;
 			tv.tv_usec = 0;
-			nw = system_clock::now();
+			nw = chr::system_clock::now();
 			continue;
 		}
 		else {

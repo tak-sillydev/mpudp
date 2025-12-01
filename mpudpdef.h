@@ -7,4 +7,7 @@
 
 #define	PING_TIMEOUT_MSEC	950
 
+#define	BALANCE_ROUNDROBIN	0
+#define	BALANCE_DYNAMICSEL	1
+
 #endif

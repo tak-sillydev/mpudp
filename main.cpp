@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <random>
 
 #include "print.h"
 #include "network.h"

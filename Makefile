@@ -1,6 +1,6 @@
 TARGET	= mpudp.out
 CC		= g++
-CPPFLAGS	= -Wall -O3 -g
+CPPFLAGS	= -Wall -O3 -g 
 OBJS	= main.o network.o print.o client.o server.o mpudp.o
 INCS	= network.h server.h print.h ringbuf.h mpudp.h mpudpdef.h
 
